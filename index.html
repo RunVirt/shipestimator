@@ -1,0 +1,594 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RunVirt Bib Shipping Estimator</title>
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Inter', sans-serif; }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect } = React;
+
+        const ProductShippingEstimator = () => {
+          const [formData, setFormData] = useState({
+            product: 'tyvek',
+            quantity: '',
+            destinationZip: '',
+            serviceType: 'ground'
+          });
+
+          const [calculatedSpecs, setCalculatedSpecs] = useState(null);
+          const [estimate, setEstimate] = useState(null);
+          const [errors, setErrors] = useState({});
+
+          const originZip = '29626'; // Fixed origin
+
+          const productSpecs = {
+            tyvek: {
+              name: 'Tyvek',
+              weightPer100: 0.46,
+              maxPerCarton: 8000,
+              boxLogic: [
+                { maxQty: 1500, dimensions: { length: 12, width: 9, height: 6 }, type: 'Box' },
+                { maxQty: 3500, dimensions: { length: 15, width: 15, height: 7 }, type: 'Box' },
+                { maxQty: 8000, dimensions: { length: 18, width: 14, height: 12 }, type: 'Box' }
+              ]
+            },
+            drytex: {
+              name: 'DryTex',
+              weightPer100: 0.76,
+              maxPerCarton: 8000,
+              boxLogic: [
+                { maxQty: 800, dimensions: { length: 9, width: 7, height: 4 }, type: 'Poly Mailer' },
+                { maxQty: 2000, dimensions: { length: 12, width: 9, height: 6 }, type: 'Box' },
+                { maxQty: 5000, dimensions: { length: 12, width: 8, height: 10 }, type: 'Box' },
+                { maxQty: 8000, dimensions: { length: 15, width: 15, height: 7 }, type: 'Box' }
+              ]
+            }
+          };
+
+          const serviceTypes = {
+            'ground': { name: 'UPS Ground', baseRate: 0.85, multiplier: 1.0 },
+            'air': { name: 'UPS 2nd Day Air', baseRate: 1.20, multiplier: 1.8 },
+            'next_day': { name: 'UPS Next Day Air', baseRate: 1.80, multiplier: 3.2 },
+            'express': { name: 'UPS Express', baseRate: 2.20, multiplier: 4.5 }
+          };
+
+          const calculateProductSpecs = (product, quantity) => {
+            const specs = productSpecs[product];
+            const totalWeight = (quantity / 100) * specs.weightPer100;
+            
+            const isMultiPiece = quantity > specs.maxPerCarton;
+            const pieces = [];
+            
+            if (isMultiPiece) {
+              const fullCartons = Math.floor(quantity / specs.maxPerCarton);
+              const remainingQty = quantity % specs.maxPerCarton;
+              
+              for (let i = 0; i < fullCartons; i++) {
+                const boxInfo = getBoxForQuantity(specs, specs.maxPerCarton);
+                pieces.push({
+                  quantity: specs.maxPerCarton,
+                  weight: (specs.maxPerCarton / 100) * specs.weightPer100,
+                  dimensions: boxInfo.dimensions,
+                  type: boxInfo.type
+                });
+              }
+              
+              if (remainingQty > 0) {
+                const boxInfo = getBoxForQuantity(specs, remainingQty);
+                pieces.push({
+                  quantity: remainingQty,
+                  weight: (remainingQty / 100) * specs.weightPer100,
+                  dimensions: boxInfo.dimensions,
+                  type: boxInfo.type
+                });
+              }
+            } else {
+              const boxInfo = getBoxForQuantity(specs, quantity);
+              pieces.push({
+                quantity: quantity,
+                weight: totalWeight,
+                dimensions: boxInfo.dimensions,
+                type: boxInfo.type
+              });
+            }
+
+            return {
+              totalWeight: totalWeight,
+              pieces: pieces,
+              isMultiPiece: isMultiPiece,
+              productName: specs.name
+            };
+          };
+
+          const getBoxForQuantity = (specs, quantity) => {
+            for (let box of specs.boxLogic) {
+              if (quantity <= box.maxQty) {
+                return box;
+              }
+            }
+            return specs.boxLogic[specs.boxLogic.length - 1];
+          };
+
+          useEffect(() => {
+            if (formData.product && formData.quantity && formData.quantity > 0) {
+              const specs = calculateProductSpecs(formData.product, parseInt(formData.quantity));
+              setCalculatedSpecs(specs);
+            } else {
+              setCalculatedSpecs(null);
+            }
+          }, [formData.product, formData.quantity]);
+
+          const validateForm = () => {
+            const newErrors = {};
+            
+            if (!formData.quantity || formData.quantity <= 0) {
+              newErrors.quantity = 'Quantity must be greater than 0';
+            }
+            if (!formData.destinationZip || formData.destinationZip.length !== 5) {
+              newErrors.destinationZip = 'Destination ZIP must be 5 digits';
+            }
+
+            setErrors(newErrors);
+            return Object.keys(newErrors).length === 0;
+          };
+
+          const calculateDimensionalWeight = (dimensions) => {
+            const { length, width, height } = dimensions;
+            const dimensionalWeight = (length * width * height) / 139;
+            return Math.ceil(dimensionalWeight * 100) / 100;
+          };
+
+          const getZoneFactor = (originZip, destZip) => {
+            const origin = parseInt(originZip.substring(0, 3));
+            const dest = parseInt(destZip.substring(0, 3));
+            const distance = Math.abs(origin - dest);
+            
+            if (distance <= 150) return 1.0;
+            if (distance <= 300) return 1.1;
+            if (distance <= 600) return 1.2;
+            if (distance <= 1000) return 1.3;
+            return 1.4;
+          };
+
+          const calculateShippingCost = () => {
+            if (!validateForm() || !calculatedSpecs) return;
+
+            let totalBaseCost = 0;
+            let totalFuelSurcharge = 0;
+            const service = serviceTypes[formData.serviceType];
+            const zoneFactor = getZoneFactor(originZip, formData.destinationZip);
+            
+            const pieceDetails = calculatedSpecs.pieces.map((piece, index) => {
+              const actualWeight = piece.weight;
+              const dimensionalWeight = calculateDimensionalWeight(piece.dimensions);
+              const billableWeight = Math.max(actualWeight, dimensionalWeight);
+              
+              let baseCost = billableWeight * service.baseRate;
+              baseCost *= service.multiplier;
+              baseCost *= zoneFactor;
+              
+              const fuelSurcharge = baseCost * 0.095;
+              
+              totalBaseCost += baseCost;
+              totalFuelSurcharge += fuelSurcharge;
+              
+              return {
+                pieceNumber: index + 1,
+                quantity: piece.quantity,
+                actualWeight,
+                dimensionalWeight,
+                billableWeight,
+                baseCost,
+                fuelSurcharge,
+                boxSize: `${piece.dimensions.length}" × ${piece.dimensions.width}" × ${piece.dimensions.height}" ${piece.type}`
+              };
+            });
+            
+            const residentialSurcharge = 4.95;
+            const totalCost = totalBaseCost + totalFuelSurcharge + residentialSurcharge;
+
+            setEstimate({
+              pieces: pieceDetails,
+              totalBaseCost,
+              totalFuelSurcharge,
+              residentialSurcharge,
+              totalCost,
+              serviceName: service.name,
+              estimatedDays: getEstimatedDays(formData.serviceType),
+              productName: calculatedSpecs.productName,
+              quantity: parseInt(formData.quantity),
+              isMultiPiece: calculatedSpecs.isMultiPiece,
+              totalWeight: calculatedSpecs.totalWeight
+            });
+          };
+
+          const getEstimatedDays = (serviceType) => {
+            switch (serviceType) {
+              case 'ground': return '1-5 business days';
+              case 'air': return '2 business days';
+              case 'next_day': return '1 business day';
+              case 'express': return 'Same day';
+              default: return '1-5 business days';
+            }
+          };
+
+          const handleInputChange = (e) => {
+            const { name, value } = e.target;
+            setFormData(prev => ({
+              ...prev,
+              [name]: value
+            }));
+            
+            if (errors[name]) {
+              setErrors(prev => ({
+                ...prev,
+                [name]: ''
+              }));
+            }
+          };
+
+          const PackageIcon = () => (
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="m7.5 4.27 9 5.15"/>
+              <path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"/>
+              <path d="m3.3 7 8.7 5 8.7-5"/>
+              <path d="M12 22V12"/>
+            </svg>
+          );
+
+          const MapPinIcon = () => (
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z"/>
+              <circle cx="12" cy="10" r="3"/>
+            </svg>
+          );
+
+          const DollarSignIcon = () => (
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <line x1="12" y1="1" x2="12" y2="23"/>
+              <path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/>
+            </svg>
+          );
+
+          const CalculatorIcon = () => (
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <rect width="16" height="20" x="4" y="2" rx="2"/>
+              <line x1="8" y1="6" x2="16" y2="6"/>
+              <line x1="16" y1="14" x2="16" y2="14"/>
+              <line x1="16" y1="18" x2="16" y2="18"/>
+              <line x1="12" y1="14" x2="12" y2="14"/>
+              <line x1="12" y1="18" x2="12" y2="18"/>
+              <line x1="8" y1="14" x2="8" y2="14"/>
+              <line x1="8" y1="18" x2="8" y2="18"/>
+            </svg>
+          );
+
+          return (
+            <div className="max-w-4xl mx-auto p-6 bg-white" style={{ fontFamily: '"Inter", "Helvetica Neue", "Arial", sans-serif' }}>
+              <div className="text-center mb-8">
+                <div className="flex items-center justify-center mb-6">
+                  <img 
+                    src="https://github.com/RunVirt/shipestimator/raw/main/runvirt-gifs.gif"
+                    alt="RunVirt Logo" 
+                    className="h-16 mb-4"
+                    style={{ maxWidth: '200px' }}
+                    onError={(e) => {
+                      e.target.style.display = 'none';
+                      const fallback = e.target.nextElementSibling;
+                      if (fallback) fallback.style.display = 'flex';
+                    }}
+                  />
+                  
+                  <div className="mb-4 items-center justify-center" style={{ display: 'none', fontFamily: '"Inter", "Helvetica Neue", "Arial", sans-serif' }}>
+                    <div className="flex items-baseline justify-center">
+                      <span 
+                        className="text-5xl font-bold mr-1" 
+                        style={{ color: '#B89768', fontWeight: '800' }}
+                      >
+                        Run
+                      </span>
+                      <span 
+                        className="text-5xl font-bold" 
+                        style={{ color: '#4770A9', fontWeight: '800' }}
+                      >
+                        Virt
+                      </span>
+                    </div>
+                    <div className="text-center text-sm font-bold mt-1 tracking-wider">
+                      <span style={{ color: '#B89768' }}>BIBS</span>
+                      <span className="mx-2" style={{ color: '#333' }}>&</span>
+                      <span style={{ color: '#4770A9' }}>BEYOND</span>
+                    </div>
+                  </div>
+                </div>
+                <h1 className="text-3xl font-bold mb-2" style={{ color: '#4770A9', fontWeight: '700' }}>
+                  RunVirt Bib Shipping Estimator
+                </h1>
+                <p className="text-gray-600">Calculate shipping costs for Tyvek and DryTex products from Anderson, SC (29626)</p>
+              </div>
+
+              <div className="grid md:grid-cols-2 gap-8">
+                <div className="bg-gray-50 p-6 rounded-lg border border-gray-200">
+                  <h2 className="text-xl font-semibold mb-4 flex items-center" style={{ color: '#4770A9' }}>
+                    <PackageIcon />
+                    <span className="ml-2">Product Details</span>
+                  </h2>
+                  
+                  <div className="space-y-4">
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-1">
+                        Product Type
+                      </label>
+                      <select
+                        name="product"
+                        value={formData.product}
+                        onChange={handleInputChange}
+                        className="w-full p-2 border border-gray-300 rounded-md focus:ring-2 focus:border-transparent"
+                        style={{ focusRingColor: '#4770A9' }}
+                        onFocus={(e) => e.target.style.borderColor = '#4770A9'}
+                        onBlur={(e) => e.target.style.borderColor = '#d1d5db'}
+                      >
+                        <option value="tyvek">Tyvek (0.46 lbs per 100)</option>
+                        <option value="drytex">DryTex (0.76 lbs per 100)</option>
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-1">
+                        Quantity (Tyvek: 1-∞, DryTex: 1-∞)
+                      </label>
+                      <input
+                        type="number"
+                        name="quantity"
+                        value={formData.quantity}
+                        onChange={handleInputChange}
+                        className={`w-full p-2 border rounded-md focus:ring-2 focus:border-transparent ${
+                          errors.quantity ? 'border-red-500' : 'border-gray-300'
+                        }`}
+                        style={!errors.quantity ? {
+                          focusRingColor: '#4770A9'
+                        } : {}}
+                        onFocus={(e) => !errors.quantity && (e.target.style.borderColor = '#4770A9')}
+                        onBlur={(e) => !errors.quantity && (e.target.style.borderColor = '#d1d5db')}
+                        placeholder="Enter quantity"
+                        min="1"
+                      />
+                      {errors.quantity && <p className="text-red-500 text-sm mt-1">{errors.quantity}</p>}
+                    </div>
+
+                    {calculatedSpecs && (
+                      <div className="bg-white p-4 rounded-lg border border-gray-200">
+                        <h3 className="font-medium text-gray-700 mb-2">Package Details:</h3>
+                        <div className="space-y-2 text-sm">
+                          <div className="flex justify-between">
+                            <span>Total Weight:</span>
+                            <span className="font-medium">{calculatedSpecs.totalWeight.toFixed(2)} lbs</span>
+                          </div>
+                          {calculatedSpecs.isMultiPiece && (
+                            <div className="bg-orange-50 p-2 rounded border border-orange-200">
+                              <div className="font-medium text-orange-800 mb-1">
+                                Multi-Piece Shipment ({calculatedSpecs.pieces.length} pieces)
+                              </div>
+                            </div>
+                          )}
+                          {calculatedSpecs.pieces.map((piece, index) => (
+                            <div key={index} className="border-l-2 border-gray-300 pl-3">
+                              <div className="font-medium text-gray-600">
+                                Piece {index + 1}: {piece.quantity} units
+                              </div>
+                              <div className="flex justify-between">
+                                <span>Weight:</span>
+                                <span>{piece.weight.toFixed(2)} lbs</span>
+                              </div>
+                              <div className="flex justify-between">
+                                <span>Container:</span>
+                                <span>
+                                  {piece.dimensions.length}" × {piece.dimensions.width}" × {piece.dimensions.height}" {piece.type}
+                                </span>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
+                        <label className="block text-sm font-medium text-gray-700 mb-1 flex items-center">
+                          <MapPinIcon />
+                          <span className="ml-1">Origin ZIP</span>
+                        </label>
+                        <input
+                          type="text"
+                          value={originZip}
+                          disabled
+                          className="w-full p-2 border border-gray-200 rounded-md bg-gray-100 text-gray-600"
+                        />
+                        <p className="text-xs text-gray-500 mt-1">Anderson, SC (Fixed)</p>
+                      </div>
+                      <div>
+                        <label className="block text-sm font-medium text-gray-700 mb-1 flex items-center">
+                          <MapPinIcon />
+                          <span className="ml-1">Destination ZIP</span>
+                        </label>
+                        <input
+                          type="text"
+                          name="destinationZip"
+                          value={formData.destinationZip}
+                          onChange={handleInputChange}
+                          className={`w-full p-2 border rounded-md focus:ring-2 focus:border-transparent ${
+                            errors.destinationZip ? 'border-red-500' : 'border-gray-300'
+                          }`}
+                          style={!errors.destinationZip ? {
+                            focusRingColor: '#4770A9'
+                          } : {}}
+                          onFocus={(e) => !errors.destinationZip && (e.target.style.borderColor = '#4770A9')}
+                          onBlur={(e) => !errors.destinationZip && (e.target.style.borderColor = '#d1d5db')}
+                          placeholder="54321"
+                          maxLength="5"
+                        />
+                        {errors.destinationZip && <p className="text-red-500 text-xs mt-1">{errors.destinationZip}</p>}
+                      </div>
+                    </div>
+
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-1">
+                        Service Type
+                      </label>
+                      <select
+                        name="serviceType"
+                        value={formData.serviceType}
+                        onChange={handleInputChange}
+                        className="w-full p-2 border border-gray-300 rounded-md focus:ring-2 focus:border-transparent"
+                        style={{ focusRingColor: '#4770A9' }}
+                        onFocus={(e) => e.target.style.borderColor = '#4770A9'}
+                        onBlur={(e) => e.target.style.borderColor = '#d1d5db'}
+                      >
+                        {Object.entries(serviceTypes).map(([key, service]) => (
+                          <option key={key} value={key}>
+                            {service.name}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <button
+                      onClick={calculateShippingCost}
+                      disabled={!calculatedSpecs}
+                      className={`w-full py-3 px-4 rounded-md transition-colors flex items-center justify-center ${
+                        calculatedSpecs 
+                          ? 'text-white hover:opacity-90' 
+                          : 'bg-gray-300 text-gray-500 cursor-not-allowed'
+                      }`}
+                      style={calculatedSpecs ? { backgroundColor: '#4770A9' } : {}}
+                    >
+                      <CalculatorIcon />
+                      <span className="ml-2">Calculate Shipping Cost</span>
+                    </button>
+                  </div>
+                </div>
+
+                <div className="bg-gray-50 p-6 rounded-lg border border-gray-200">
+                  <h2 className="text-xl font-semibold mb-4 flex items-center" style={{ color: '#4770A9' }}>
+                    <DollarSignIcon />
+                    <span className="ml-2">Cost Estimate</span>
+                  </h2>
+                  
+                  {estimate ? (
+                    <div className="space-y-4">
+                      <div className="bg-white p-4 rounded-lg border border-gray-200">
+                        <div className="flex justify-between items-start mb-2">
+                          <div>
+                            <span className="font-semibold text-lg">{estimate.serviceName}</span>
+                            <div className="text-sm text-gray-600">
+                              {estimate.quantity} × {estimate.productName}
+                              {estimate.isMultiPiece && (
+                                <span className="ml-2 px-2 py-1 bg-orange-100 text-orange-800 text-xs rounded">
+                                  {estimate.pieces.length} pieces
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                          <span className="text-sm text-gray-600">{estimate.estimatedDays}</span>
+                        </div>
+                        <div className="text-3xl font-bold" style={{ color: '#4770A9' }}>
+                          ${estimate.totalCost.toFixed(2)}
+                        </div>
+                      </div>
+
+                      <div className="space-y-2">
+                        <h3 className="font-medium text-gray-700">Cost Breakdown:</h3>
+                        <div className="bg-white p-3 rounded border">
+                          <div className="flex justify-between text-sm">
+                            <span>Base Cost (All Pieces):</span>
+                            <span>${estimate.totalBaseCost.toFixed(2)}</span>
+                          </div>
+                          <div className="flex justify-between text-sm">
+                            <span>Fuel Surcharge (9.5%):</span>
+                            <span>${estimate.totalFuelSurcharge.toFixed(2)}</span>
+                          </div>
+                          <div className="flex justify-between text-sm">
+                            <span>Residential Surcharge:</span>
+                            <span>${estimate.residentialSurcharge.toFixed(2)}</span>
+                          </div>
+                          <div className="border-t pt-2 mt-2 flex justify-between font-semibold">
+                            <span>Total:</span>
+                            <span>${estimate.totalCost.toFixed(2)}</span>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="space-y-2">
+                        <h3 className="font-medium text-gray-700">Package Details:</h3>
+                        <div className="bg-white p-3 rounded border text-sm space-y-3">
+                          <div className="flex justify-between font-medium">
+                            <span>Total Weight:</span>
+                            <span>{estimate.totalWeight.toFixed(2)} lbs</span>
+                          </div>
+                          
+                          {estimate.pieces.map((piece, index) => (
+                            <div key={index} className="border-l-2 pl-3 bg-gray-50 p-2 rounded" style={{ borderColor: '#4770A9' }}>
+                              <div className="font-medium mb-1" style={{ color: '#4770A9' }}>
+                                Piece {piece.pieceNumber}: {piece.quantity} units
+                              </div>
+                              <div className="grid grid-cols-2 gap-2 text-xs">
+                                <div className="flex justify-between">
+                                  <span>Container:</span>
+                                  <span className="font-medium">{piece.boxSize}</span>
+                                </div>
+                                <div className="flex justify-between">
+                                  <span>Cost:</span>
+                                  <span className="font-medium">${(piece.baseCost + piece.fuelSurcharge).toFixed(2)}</span>
+                                </div>
+                                <div className="flex justify-between">
+                                  <span>Actual Weight:</span>
+                                  <span>{piece.actualWeight.toFixed(2)} lbs</span>
+                                </div>
+                                <div className="flex justify-between">
+                                  <span>Billable Weight:</span>
+                                  <span>{piece.billableWeight.toFixed(2)} lbs</span>
+                                </div>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+
+                      <div className="bg-blue-50 p-3 rounded border border-blue-200">
+                        <p className="text-sm text-blue-800">
+                          <strong>Note:</strong> This is an estimate based on your product specifications. 
+                          {estimate.isMultiPiece && ' Multi-piece shipments may have additional handling considerations.'}
+                          {' '}Actual UPS rates may vary with current pricing and additional services.
+                        </p>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="text-center text-gray-500 py-8">
+                      <PackageIcon className="w-16 h-16 mx-auto mb-4 text-gray-300" />
+                      <p>Select product type and quantity to see shipping estimates</p>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          );
+        };
+
+        ReactDOM.render(<ProductShippingEstimator />, document.getElementById('root'));
+    </script>
+</body>
+</html>
