@@ -280,12 +280,12 @@
           return (
             <div className="max-w-4xl mx-auto p-6 bg-white" style={{ fontFamily: '"Inter", "Helvetica Neue", "Arial", sans-serif' }}>
               <div className="text-center mb-8">
-                <div className="flex items-center justify-center mb-6">
+                <div className="flex items-center justify-center mb-8">
                   <img 
                     src="https://github.com/RunVirt/shipestimator/raw/main/runvirt-gifs.gif"
                     alt="RunVirt Logo" 
-                    className="h-16 mb-4"
-                    style={{ maxWidth: '200px' }}
+                    className="mb-6"
+                    style={{ height: '160px', maxWidth: '800px', width: 'auto' }}
                     onError={(e) => {
                       e.target.style.display = 'none';
                       const fallback = e.target.nextElementSibling;
@@ -293,24 +293,24 @@
                     }}
                   />
                   
-                  <div className="mb-4 items-center justify-center" style={{ display: 'none', fontFamily: '"Inter", "Helvetica Neue", "Arial", sans-serif' }}>
+                  <div className="mb-6 items-center justify-center" style={{ display: 'none', fontFamily: '"Inter", "Helvetica Neue", "Arial", sans-serif' }}>
                     <div className="flex items-baseline justify-center">
                       <span 
-                        className="text-5xl font-bold mr-1" 
-                        style={{ color: '#B89768', fontWeight: '800' }}
+                        className="font-bold mr-2" 
+                        style={{ color: '#B89768', fontWeight: '800', fontSize: '120px' }}
                       >
                         Run
                       </span>
                       <span 
-                        className="text-5xl font-bold" 
-                        style={{ color: '#4770A9', fontWeight: '800' }}
+                        className="font-bold" 
+                        style={{ color: '#4770A9', fontWeight: '800', fontSize: '120px' }}
                       >
                         Virt
                       </span>
                     </div>
-                    <div className="text-center text-sm font-bold mt-1 tracking-wider">
+                    <div className="text-center font-bold mt-4" style={{ fontSize: '24px', letterSpacing: '4px' }}>
                       <span style={{ color: '#B89768' }}>BIBS</span>
-                      <span className="mx-2" style={{ color: '#333' }}>&</span>
+                      <span className="mx-4" style={{ color: '#333' }}>&</span>
                       <span style={{ color: '#4770A9' }}>BEYOND</span>
                     </div>
                   </div>
