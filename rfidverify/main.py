@@ -210,7 +210,7 @@ class PrinterConnection:
     def send_setup(self, power: int, position: str):
         frame = _frame(CMD_SETUP, _setup_payload(power, position))
         self._send_frame(frame)
-        logging.debug("RFID setup command sent (no response expected)")
+        logging.info("RFID setup command sent (no response expected)")
 
     def clear_buffer(self):
         self._send_frame(_frame(CMD_CLEAR))
@@ -235,7 +235,7 @@ class PrinterConnection:
         if not self._sock:
             return
         if self.debug:
-            logging.debug("TX: %s", frame.hex())
+            print(f"TX: {frame.hex()}", flush=True)
         try:
             self._sock.sendall(frame)
         except OSError as e:
@@ -254,9 +254,31 @@ class PrinterConnection:
             buf += chunk
         return buf
 
+    def _recv_raw(self, timeout: float) -> bytes:
+        """Read whatever the printer sends back, raw, for debug purposes."""
+        buf = b""
+        self._sock.settimeout(timeout)
+        try:
+            while True:
+                chunk = self._sock.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+        except OSError:
+            pass
+        return buf
+
     def _recv_batch(self, expected: int) -> List[Tuple[str, int, int]]:
         tags: List[Tuple[str, int, int]] = []
         deadline = time.time() + self.timeout
+
+        # In debug mode, dump raw bytes first so we can see the real protocol
+        if self.debug:
+            raw = self._recv_raw(min(3.0, self.timeout))
+            if raw:
+                print(f"RAW RX ({len(raw)} bytes): {raw.hex()}", flush=True)
+                print(f"RAW RX (text): {raw!r}", flush=True)
+            return tags
 
         while time.time() < deadline:
             hdr = self._recv_exact(3)  # [cmd:1][len:2]
@@ -269,7 +291,7 @@ class PrinterConnection:
                 break
 
             if self.debug:
-                logging.debug("RX cmd=0x%02X payload=%s", cmd, (payload or b"").hex())
+                print(f"RX cmd=0x{cmd:02X} payload={payload.hex() if payload else ''}", flush=True)
 
             if cmd == RESP_TAG and payload and len(payload) >= 14:
                 epc = payload[:12].hex().upper()
@@ -610,15 +632,16 @@ def on_import(data: dict):
 def main():
     global _settings, _db
 
-    logging.basicConfig(
-        level=logging.DEBUG if "--debug" in sys.argv else logging.INFO,
-        format="%(asctime)s  %(levelname)-8s  %(message)s",
-        datefmt="%H:%M:%S",
-    )
-
     _settings = load_settings()
     if "--debug" in sys.argv:
         _settings["debug"] = True
+
+    debug_on = _settings.get("debug", False) or "--debug" in sys.argv
+    logging.basicConfig(
+        level=logging.DEBUG if debug_on else logging.INFO,
+        format="%(asctime)s  %(levelname)-8s  %(message)s",
+        datefmt="%H:%M:%S",
+    )
 
     db_path = _settings.get("encodingDb", "")
     try:
