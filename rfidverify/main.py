@@ -15,7 +15,6 @@ import json
 import logging
 import os
 import socket
-import struct
 import sys
 import threading
 import time
@@ -82,35 +81,43 @@ RFID_ERRORS: Dict[int, str] = {
     0x12: "TM ASSERT FAILED",
 }
 
-# ─── Printer command bytes (Zebra/IPICO port-6101 binary protocol) ────────────
-# Each frame: [CMD:1][LEN:2 LE][PAYLOAD:LEN]
-# Adjust these if your firmware version uses different opcodes.
+# ─── ZPL command builders ─────────────────────────────────────────────────────
+# Zebra printers speak ZPL (Zebra Programming Language) over TCP.
+# ^XA / ^XZ  = start / end of format
+# ^RS        = RFID Setup  (type, antenna, read-power, write-power, …)
+# ^RFR,H,0,12= Read RFID field: hex, starting block 0, 12 bytes (EPC)
+# ^PQ<n>     = Print/process Quantity
+# ^HV<f>,<l> = Host Verify: send field data back over the comms port
 
-CMD_SETUP   = 0x01   # Set power + position; no response expected
-CMD_READ    = 0x02   # Trigger batch inventory read
-CMD_CLEAR   = 0x03   # Clear tag buffer
-CMD_PAUSE   = 0x04
-CMD_RESUME  = 0x05
+def zpl_setup(power: int, position: str) -> bytes:
+    """Configure RFID antenna and read power. No response expected."""
+    # ^RS<type=A GEN2>,<position>,<read-power>
+    return f"^XA^RSA,{position},{power}^XZ\n".encode()
 
-# Response frame types from printer
-RESP_TAG    = 0x10   # One tag: [EPC:12][RSSI:1 signed][ERR:1]
-RESP_DONE   = 0x11   # Batch complete: [count:2 LE]
-RESP_ERROR  = 0x12   # [error_code:1]
+def zpl_clear() -> bytes:
+    return b"^XA^XZ\n"
 
-TAG_POSITION_CODES = {
-    "F0": 0x00, "F10": 0x01,
-    "B0": 0x10, "B10": 0x11, "B20": 0x12, "B30": 0x13,
-}
+def zpl_pause() -> bytes:
+    return b"~PP\n"
 
-def _frame(cmd: int, payload: bytes = b"") -> bytes:
-    return bytes([cmd]) + struct.pack("<H", len(payload)) + payload
+def zpl_resume() -> bytes:
+    return b"~PS\n"
 
-def _setup_payload(power: int, position: str) -> bytes:
-    pos_byte = TAG_POSITION_CODES.get(position, 0x00)
-    return bytes([power & 0xFF, pos_byte])
-
-def _read_payload(batch_size: int) -> bytes:
-    return struct.pack("<H", batch_size)
+def zpl_read_batch(batch_size: int) -> bytes:
+    """
+    ZPL format that reads the EPC from each label and sends it back to
+    the host via ^HV. The printer processes <batch_size> labels.
+    Response lines look like: <24-char hex EPC>\r\n
+    """
+    return (
+        f"^XA"
+        f"^PQ{batch_size}"
+        f"^RS"
+        f"^RFR,H,0,12"
+        f"^FN1^FD^FS"
+        f"^HV1,24"
+        f"^XZ\n"
+    ).encode()
 
 # ─── Encoding Database ────────────────────────────────────────────────────────
 
@@ -168,12 +175,10 @@ class FailedBibTracker:
 
 class PrinterConnection:
     """
-    Manages the TCP socket to the Zebra/IPICO printer on port 6101.
-
-    The binary framing (CMD/LEN/PAYLOAD) is described at the top of
-    this file. If the actual printer uses a different wire format,
-    override _send_frame() and _recv_frames() without touching the
-    rest of the application.
+    Manages the TCP socket to the Zebra printer on port 6101.
+    Communicates using ZPL (Zebra Programming Language) text commands.
+    Tag data is returned by the printer as plain text lines over the
+    same socket, one EPC per line.
     """
 
     def __init__(self, ip: str, port: int, timeout: int, debug: bool = False):
@@ -182,6 +187,7 @@ class PrinterConnection:
         self.timeout = timeout
         self.debug = debug
         self._sock: Optional[socket.socket] = None
+        self._buf = b""
 
     @property
     def connected(self) -> bool:
@@ -193,6 +199,7 @@ class PrinterConnection:
             s.settimeout(self.timeout)
             s.connect((self.ip, self.port))
             self._sock = s
+            self._buf = b""
             logging.info("Connected to printer at %s:%d", self.ip, self.port)
             return True
         except OSError as e:
@@ -208,108 +215,137 @@ class PrinterConnection:
             self._sock = None
 
     def send_setup(self, power: int, position: str):
-        frame = _frame(CMD_SETUP, _setup_payload(power, position))
-        self._send_frame(frame)
-        logging.info("RFID setup command sent (no response expected)")
+        cmd = zpl_setup(power, position)
+        self._send(cmd)
+        logging.info("RFID setup sent: power=%d pos=%s", power, position)
 
     def clear_buffer(self):
-        self._send_frame(_frame(CMD_CLEAR))
+        self._send(zpl_clear())
 
     def pause_printer(self):
-        self._send_frame(_frame(CMD_PAUSE))
+        self._send(zpl_pause())
 
     def resume_printer(self):
-        self._send_frame(_frame(CMD_RESUME))
+        self._send(zpl_resume())
 
     def read_batch(self, batch_size: int) -> List[Tuple[str, int, int]]:
         """
-        Send a read command and collect tag responses.
+        Send ZPL to process a batch of labels, collect EPC responses.
         Returns list of (epc_hex_str, rssi_dBm, error_code).
+        RSSI is 0 when the printer does not report it; error_code 0 = OK.
         """
-        self._send_frame(_frame(CMD_READ, _read_payload(batch_size)))
-        return self._recv_batch(batch_size)
+        self._send(zpl_read_batch(batch_size))
+        return self._recv_lines(batch_size)
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
-    def _send_frame(self, frame: bytes):
+    def _send(self, data: bytes):
         if not self._sock:
             return
         if self.debug:
-            print(f"TX: {frame.hex()}", flush=True)
+            print(f"TX: {data!r}", flush=True)
         try:
-            self._sock.sendall(frame)
+            self._sock.sendall(data)
         except OSError as e:
             logging.error("Send error: %s", e)
             self.disconnect()
 
-    def _recv_exact(self, n: int) -> Optional[bytes]:
-        buf = b""
-        while len(buf) < n:
-            try:
-                chunk = self._sock.recv(n - len(buf))
-            except OSError:
-                return None
-            if not chunk:
-                return None
-            buf += chunk
-        return buf
-
-    def _recv_raw(self, timeout: float) -> bytes:
-        """Read whatever the printer sends back, raw, for debug purposes."""
-        buf = b""
-        self._sock.settimeout(timeout)
-        try:
-            while True:
-                chunk = self._sock.recv(4096)
-                if not chunk:
-                    break
-                buf += chunk
-        except OSError:
-            pass
-        return buf
-
-    def _recv_batch(self, expected: int) -> List[Tuple[str, int, int]]:
+    def _recv_lines(self, expected: int) -> List[Tuple[str, int, int]]:
+        """
+        Read newline-delimited responses from the printer.
+        In debug mode, also dumps the raw bytes so we can see the
+        actual format and adjust the parser if needed.
+        """
         tags: List[Tuple[str, int, int]] = []
         deadline = time.time() + self.timeout
 
-        # In debug mode, dump raw bytes first so we can see the real protocol
-        if self.debug:
-            raw = self._recv_raw(min(3.0, self.timeout))
-            if raw:
-                print(f"RAW RX ({len(raw)} bytes): {raw.hex()}", flush=True)
-                print(f"RAW RX (text): {raw!r}", flush=True)
-            return tags
-
-        while time.time() < deadline:
-            hdr = self._recv_exact(3)  # [cmd:1][len:2]
-            if not hdr:
+        while len(tags) < expected and time.time() < deadline:
+            remaining = max(0.5, deadline - time.time())
+            self._sock.settimeout(remaining)
+            try:
+                chunk = self._sock.recv(4096)
+            except socket.timeout:
                 break
-            cmd = hdr[0]
-            length = struct.unpack_from("<H", hdr, 1)[0]
-            payload = self._recv_exact(length) if length else b""
-            if payload is None:
+            except OSError as e:
+                logging.error("Recv error: %s", e)
+                break
+
+            if not chunk:
                 break
 
             if self.debug:
-                print(f"RX cmd=0x{cmd:02X} payload={payload.hex() if payload else ''}", flush=True)
+                print(f"RAW RX ({len(chunk)} bytes): {chunk.hex()}", flush=True)
+                print(f"RAW RX (text): {chunk!r}", flush=True)
 
-            if cmd == RESP_TAG and payload and len(payload) >= 14:
-                epc = payload[:12].hex().upper()
-                rssi = struct.unpack_from("b", payload, 12)[0]  # signed byte
-                err  = payload[13] if len(payload) > 13 else 0
-                tags.append((epc, rssi, err))
-                if len(tags) >= expected:
-                    break
+            self._buf += chunk
 
-            elif cmd == RESP_DONE:
-                break  # Batch finished before expected count
-
-            elif cmd == RESP_ERROR:
-                err_code = payload[0] if payload else 0xFF
-                logging.warning("Printer error: %s", RFID_ERRORS.get(err_code, f"0x{err_code:02X}"))
-                break
+            # Parse complete lines
+            while b"\n" in self._buf:
+                line, self._buf = self._buf.split(b"\n", 1)
+                line = line.rstrip(b"\r").decode(errors="replace").strip()
+                if self.debug:
+                    print(f"LINE: {line!r}", flush=True)
+                parsed = self._parse_line(line)
+                if parsed:
+                    tags.append(parsed)
+                    if len(tags) >= expected:
+                        break
 
         return tags
+
+    def _parse_line(self, line: str) -> Optional[Tuple[str, int, int]]:
+        """
+        Parse one response line from the printer.
+        Handles several common Zebra RFID response formats:
+          - Plain 24-char hex EPC:   000000015000...
+          - Prefixed:                EPC:000000015000
+          - Status with RSSI:        000000015000 RSSI=-55 ERR=0
+          - RFID OK / error strings: RFID OK, NO TAG FOUND, etc.
+        """
+        line = line.strip().upper()
+        if not line:
+            return None
+
+        # Map plain RFID status strings to error codes
+        for code, msg in RFID_ERRORS.items():
+            if line == msg:
+                if code == 0x00:
+                    return None  # "RFID OK" with no EPC — skip
+                logging.debug("Printer status: %s", msg)
+                return None
+
+        # Strip common prefixes
+        for prefix in ("EPC:", "RFID:", "TAG:", "DATA:"):
+            if line.startswith(prefix):
+                line = line[len(prefix):].strip()
+                break
+
+        # Extract optional RSSI and ERR tokens first
+        rssi = 0
+        err  = 0
+        parts = line.split()
+        epc_candidate = parts[0] if parts else ""
+        for token in parts[1:]:
+            if token.startswith("RSSI="):
+                try:
+                    rssi = int(token[5:])
+                except ValueError:
+                    pass
+            elif token.startswith("ERR="):
+                try:
+                    err = int(token[4:])
+                except ValueError:
+                    pass
+
+        # Validate EPC: must be 12, 24, or 16 hex chars (96-bit or 64-bit EPC)
+        epc = epc_candidate.replace(" ", "")
+        if epc and all(c in "0123456789ABCDEF" for c in epc) and len(epc) in (12, 16, 24):
+            # Normalise to 12 hex chars (6 bytes) used by EliteFeats CSV
+            if len(epc) == 24:
+                epc = epc[:12]   # first 6 bytes = EPC header + bib number
+            return (epc, rssi, err)
+
+        return None
 
 # ─── Verification Runner ──────────────────────────────────────────────────────
 
