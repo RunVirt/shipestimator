@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RFID Verifier — EliteFeats</title>
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:      #0f1117;
+      --surface: #1a1d27;
+      --border:  #2a2d3e;
+      --accent:  #4f7cff;
+      --green:   #22c55e;
+      --red:     #ef4444;
+      --yellow:  #f59e0b;
+      --text:    #e2e8f0;
+      --muted:   #94a3b8;
+      --font:    'Segoe UI', system-ui, sans-serif;
+    }
+
+    body { background: var(--bg); color: var(--text); font-family: var(--font);
+           font-size: 14px; min-height: 100vh; }
+
+    header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 14px 24px;
+      display: flex; align-items: center; gap: 14px;
+    }
+    header h1 { font-size: 18px; font-weight: 600; }
+    header .badge {
+      font-size: 11px; padding: 2px 8px; border-radius: 12px;
+      background: var(--accent); color: #fff; font-weight: 500;
+    }
+    #conn-dot {
+      width: 10px; height: 10px; border-radius: 50%; margin-left: auto;
+      background: var(--muted); transition: background .3s;
+    }
+    #conn-dot.ok  { background: var(--green); }
+    #conn-dot.err { background: var(--red); }
+
+    .layout { display: grid; grid-template-columns: 320px 1fr;
+              gap: 0; height: calc(100vh - 57px); }
+
+    /* ── Left panel ── */
+    .sidebar {
+      background: var(--surface); border-right: 1px solid var(--border);
+      display: flex; flex-direction: column; overflow: hidden;
+    }
+
+    .controls {
+      padding: 20px; border-bottom: 1px solid var(--border);
+      display: flex; flex-direction: column; gap: 10px;
+    }
+
+    .btn {
+      width: 100%; padding: 10px 0; border: none; border-radius: 8px;
+      font-size: 14px; font-weight: 600; cursor: pointer; transition: opacity .15s;
+    }
+    .btn:disabled { opacity: .35; cursor: default; }
+    .btn-start  { background: var(--green);  color: #fff; }
+    .btn-stop   { background: var(--red);    color: #fff; }
+    .btn-pause  { background: var(--yellow); color: #000; }
+    .btn-resume { background: var(--accent); color: #fff; }
+
+    .stats { padding: 16px 20px; border-bottom: 1px solid var(--border); }
+    .stat-row { display: flex; justify-content: space-between;
+                padding: 4px 0; font-size: 13px; }
+    .stat-row span:last-child { font-weight: 600; }
+    .stat-row .ok   { color: var(--green); }
+    .stat-row .bad  { color: var(--red);   }
+    .stat-row .warn { color: var(--yellow);}
+
+    /* settings form */
+    .settings-panel {
+      padding: 16px 20px; overflow-y: auto; flex: 1;
+    }
+    .settings-panel h3 { font-size: 12px; text-transform: uppercase;
+                         letter-spacing: .08em; color: var(--muted); margin-bottom: 12px; }
+    .field { margin-bottom: 12px; }
+    .field label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+    .field input, .field select {
+      width: 100%; padding: 7px 10px; background: var(--bg); border: 1px solid var(--border);
+      border-radius: 6px; color: var(--text); font-size: 13px; outline: none;
+    }
+    .field input:focus { border-color: var(--accent); }
+    .btn-save { background: var(--accent); color: #fff; margin-top: 4px; }
+
+    /* import section */
+    .import-panel {
+      padding: 16px 20px; border-top: 1px solid var(--border);
+    }
+    .import-panel h3 { font-size: 12px; text-transform: uppercase;
+                       letter-spacing: .08em; color: var(--muted); margin-bottom: 10px; }
+    .import-row { display: flex; gap: 6px; }
+    .import-row input { flex: 1; padding: 7px 10px; background: var(--bg);
+                        border: 1px solid var(--border); border-radius: 6px;
+                        color: var(--text); font-size: 12px; outline: none; }
+    .import-row button { padding: 7px 14px; background: var(--surface);
+                         border: 1px solid var(--border); border-radius: 6px;
+                         color: var(--text); cursor: pointer; font-size: 12px; }
+    .import-row button:hover { border-color: var(--accent); }
+
+    /* ── Main area ── */
+    .main { display: flex; flex-direction: column; overflow: hidden; }
+
+    .status-bar {
+      padding: 10px 20px; background: var(--surface); border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; gap: 12px; font-size: 13px;
+    }
+    #status-text { font-weight: 600; }
+    #db-info { margin-left: auto; color: var(--muted); font-size: 12px; }
+
+    .feed-wrap { flex: 1; overflow-y: auto; padding: 12px 16px;
+                 display: flex; flex-direction: column; gap: 4px; }
+
+    .tag-row {
+      display: grid;
+      grid-template-columns: 60px 160px 90px 80px 1fr;
+      gap: 8px; align-items: center;
+      padding: 7px 12px; border-radius: 6px; font-size: 13px;
+      background: var(--surface); border: 1px solid var(--border);
+      animation: slideIn .15s ease;
+    }
+    @keyframes slideIn { from { opacity:0; transform:translateY(-4px) } to { opacity:1; transform:none } }
+    .tag-row.success { border-color: #22c55e33; }
+    .tag-row.failure { border-color: #ef444433; background: #ef444408; }
+
+    .tag-bib  { font-weight: 700; font-size: 15px; }
+    .tag-epc  { font-family: monospace; color: var(--muted); font-size: 11px; }
+    .tag-rssi { }
+    .tag-rssi.marginal { color: var(--yellow); }
+    .tag-rssi.bad      { color: var(--red);    }
+    .tag-status { font-size: 11px; font-weight: 600; }
+    .tag-status.ok  { color: var(--green); }
+    .tag-status.err { color: var(--red);   }
+    .tag-err { color: var(--muted); font-size: 11px; overflow: hidden;
+               white-space: nowrap; text-overflow: ellipsis; }
+
+    .feed-header {
+      display: grid;
+      grid-template-columns: 60px 160px 90px 80px 1fr;
+      gap: 8px; padding: 4px 12px; font-size: 11px;
+      color: var(--muted); text-transform: uppercase; letter-spacing: .06em;
+    }
+
+    /* reprint modal */
+    #reprint-modal {
+      display: none; position: fixed; inset: 0;
+      background: rgba(0,0,0,.6); z-index: 100;
+      align-items: center; justify-content: center;
+    }
+    #reprint-modal.show { display: flex; }
+    .modal-box {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 12px; padding: 28px; width: 480px; max-height: 80vh;
+      display: flex; flex-direction: column; gap: 16px;
+    }
+    .modal-box h2 { font-size: 16px; }
+    .modal-box .subtitle { font-size: 13px; color: var(--muted); }
+    .reprint-list {
+      flex: 1; overflow-y: auto; background: var(--bg);
+      border: 1px solid var(--border); border-radius: 8px; padding: 12px;
+      font-family: monospace; font-size: 13px; line-height: 1.8;
+    }
+    .modal-footer { display: flex; gap: 10px; justify-content: flex-end; }
+    .modal-footer button { padding: 9px 20px; border-radius: 8px; border: none;
+                           cursor: pointer; font-size: 13px; font-weight: 600; }
+    .btn-close-modal { background: var(--border); color: var(--text); }
+    .btn-copy        { background: var(--accent); color: #fff; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>RFID Verifier</h1>
+  <span class="badge">EliteFeats</span>
+  <span id="conn-dot" title="WebSocket"></span>
+</header>
+
+<div class="layout">
+
+  <!-- ── Left sidebar ── -->
+  <aside class="sidebar">
+
+    <div class="controls">
+      <button class="btn btn-start"  id="btn-start"  onclick="sendCmd('start')">▶ Start Verification</button>
+      <button class="btn btn-pause"  id="btn-pause"  onclick="sendCmd('pause')"  disabled>⏸ Pause</button>
+      <button class="btn btn-resume" id="btn-resume" onclick="sendCmd('resume')" style="display:none">▶ Resume</button>
+      <button class="btn btn-stop"   id="btn-stop"   onclick="sendCmd('stop')"   disabled>■ Stop</button>
+    </div>
+
+    <div class="stats">
+      <div class="stat-row"><span>Total Tested</span>    <span id="st-total">0</span></div>
+      <div class="stat-row"><span>Successful</span>      <span id="st-ok" class="ok">0</span></div>
+      <div class="stat-row"><span>Failed / Marginal</span><span id="st-fail" class="bad">0</span></div>
+      <div class="stat-row"><span>Needs Reprint</span>   <span id="st-reprint" class="warn">0</span></div>
+    </div>
+
+    <div class="settings-panel">
+      <h3>Settings</h3>
+
+      <div class="field"><label>Printer IP</label>
+        <input id="s-ip" type="text" /></div>
+      <div class="field"><label>Port</label>
+        <input id="s-port" type="number" /></div>
+      <div class="field"><label>Read Power (0–30 dBm)</label>
+        <input id="s-power" type="number" min="0" max="30" /></div>
+      <div class="field"><label>Tag Position</label>
+        <select id="s-pos">
+          <option>F0</option><option>F10</option>
+          <option>B0</option><option>B10</option>
+          <option>B20</option><option>B30</option>
+        </select></div>
+      <div class="field"><label>Batch Size</label>
+        <input id="s-batch" type="number" min="1" max="200" /></div>
+      <div class="field"><label>Timeout (s)</label>
+        <input id="s-timeout" type="number" min="1" /></div>
+      <div class="field"><label>RSSI Threshold (dBm)</label>
+        <input id="s-rssi" type="number" /></div>
+      <div class="field"><label>Encoding DB (CSV path)</label>
+        <input id="s-db" type="text" /></div>
+
+      <button class="btn btn-save" onclick="saveSettings()">Save Settings</button>
+    </div>
+
+    <div class="import-panel">
+      <h3>Analyze Existing CSV</h3>
+      <div class="import-row">
+        <input id="import-path" type="text" placeholder="Path to rfid_reads_*.csv" />
+        <button onclick="importCSV()">Analyze</button>
+      </div>
+    </div>
+
+  </aside>
+
+  <!-- ── Main feed ── -->
+  <main class="main">
+    <div class="status-bar">
+      <span id="status-text">Idle</span>
+      <span id="db-info">—</span>
+    </div>
+    <div class="feed-header">
+      <span>Bib</span><span>EPC</span><span>RSSI</span><span>Status</span><span>Note</span>
+    </div>
+    <div class="feed-wrap" id="feed"></div>
+  </main>
+
+</div>
+
+<!-- Reprint modal -->
+<div id="reprint-modal">
+  <div class="modal-box">
+    <h2>Bibs Needing Manual Reprint</h2>
+    <div class="subtitle" id="reprint-subtitle"></div>
+    <div class="reprint-list" id="reprint-list"></div>
+    <div class="modal-footer">
+      <button class="btn-close-modal" onclick="closeModal()">Close</button>
+      <button class="btn-copy"        onclick="copyReprint()">Copy List</button>
+    </div>
+  </div>
+</div>
+
+<script>
+  const socket = io();
+
+  let stats = { total: 0, ok: 0, fail: 0, reprint: 0 };
+  let rssiThreshold = -70;
+  let reprints = [];
+
+  const MAX_FEED_ROWS = 500;
+
+  // ── Connection ──────────────────────────────────────────────────────────────
+  socket.on('connect',    () => dot('ok'));
+  socket.on('disconnect', () => dot('err'));
+
+  function dot(cls) {
+    const d = document.getElementById('conn-dot');
+    d.className = cls;
+  }
+
+  // ── Settings ────────────────────────────────────────────────────────────────
+  socket.on('settings', s => {
+    document.getElementById('s-ip').value      = s.ip      || '';
+    document.getElementById('s-port').value    = s.port    || 6101;
+    document.getElementById('s-power').value   = s.readPower !== undefined ? s.readPower : 30;
+    document.getElementById('s-pos').value     = s.tagPosition || 'F0';
+    document.getElementById('s-batch').value   = s.batchSize   || 50;
+    document.getElementById('s-timeout').value = s.timeout     || 20;
+    document.getElementById('s-rssi').value    = s.rssiThreshold !== undefined ? s.rssiThreshold : -70;
+    document.getElementById('s-db').value      = s.encodingDb   || '';
+    rssiThreshold = s.rssiThreshold || -70;
+    if (s.dbTagCount !== undefined)
+      document.getElementById('db-info').textContent =
+        `DB: ${s.dbTagCount.toLocaleString()} tags`;
+  });
+
+  function saveSettings() {
+    socket.emit('settings', {
+      ip:            document.getElementById('s-ip').value,
+      port:          +document.getElementById('s-port').value,
+      readPower:     +document.getElementById('s-power').value,
+      tagPosition:   document.getElementById('s-pos').value,
+      batchSize:     +document.getElementById('s-batch').value,
+      timeout:       +document.getElementById('s-timeout').value,
+      rssiThreshold: +document.getElementById('s-rssi').value,
+      encodingDb:    document.getElementById('s-db').value,
+    });
+  }
+
+  // ── Status ──────────────────────────────────────────────────────────────────
+  socket.on('status', s => {
+    const map = {
+      connecting: ['Connecting…',  false, false],
+      connected:  ['Connected',    false, true ],
+      running:    ['Running',      true,  true ],
+      paused:     ['Paused',       true,  true ],
+      stopped:    ['Stopped',      false, false],
+      error:      ['Error',        false, false],
+    };
+    const st = s.status || 'stopped';
+    const [label, canControl, running] = map[st] || ['Unknown', false, false];
+    document.getElementById('status-text').textContent =
+      s.error ? `Error: ${s.error}` : label;
+
+    document.getElementById('btn-start').disabled  = running;
+    document.getElementById('btn-stop').disabled   = !running;
+    document.getElementById('btn-pause').disabled  = !running || st === 'paused';
+
+    const showResume = st === 'paused';
+    document.getElementById('btn-pause').style.display  = showResume ? 'none'  : '';
+    document.getElementById('btn-resume').style.display = showResume ? ''      : 'none';
+  });
+
+  // ── Live result ─────────────────────────────────────────────────────────────
+  socket.on('result', r => {
+    stats.total = r.readAttempt || stats.total + 1;
+    if (r.success) stats.ok++; else stats.fail++;
+    updateStats();
+    addRow(r);
+  });
+
+  // ── Summary / reprint ────────────────────────────────────────────────────────
+  socket.on('summary', s => {
+    reprints = s.bibsNeedingReprint || [];
+    stats.reprint = reprints.length;
+    document.getElementById('st-reprint').textContent = stats.reprint;
+    if (reprints.length) showReprintModal(s);
+  });
+
+  // ── Helpers ─────────────────────────────────────────────────────────────────
+  function sendCmd(cmd) {
+    socket.emit(cmd);
+    if (cmd === 'start') resetStats();
+  }
+
+  function resetStats() {
+    stats = { total: 0, ok: 0, fail: 0, reprint: 0 };
+    updateStats();
+    document.getElementById('feed').innerHTML = '';
+  }
+
+  function updateStats() {
+    document.getElementById('st-total').textContent  = stats.total;
+    document.getElementById('st-ok').textContent     = stats.ok;
+    document.getElementById('st-fail').textContent   = stats.fail;
+    document.getElementById('st-reprint').textContent = stats.reprint;
+  }
+
+  function addRow(r) {
+    const feed = document.getElementById('feed');
+    const rssi  = r.rssi ?? 0;
+    const rssiCls = rssi >= rssiThreshold ? '' :
+                    rssi >= rssiThreshold - 10 ? 'marginal' : 'bad';
+
+    const row = document.createElement('div');
+    row.className = `tag-row ${r.success ? 'success' : 'failure'}`;
+    row.innerHTML = `
+      <span class="tag-bib">${esc(r.bib)}</span>
+      <span class="tag-epc">${esc(r.tagData)}</span>
+      <span class="tag-rssi ${rssiCls}">${rssi} dBm</span>
+      <span class="tag-status ${r.success ? 'ok' : 'err'}">${r.success ? 'OK' : 'FAIL'}</span>
+      <span class="tag-err">${esc(r.errorDesc || '')}</span>
+    `;
+
+    feed.insertBefore(row, feed.firstChild);
+
+    // Cap DOM size
+    while (feed.children.length > MAX_FEED_ROWS)
+      feed.removeChild(feed.lastChild);
+  }
+
+  function esc(s) {
+    return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+
+  // ── Reprint modal ────────────────────────────────────────────────────────────
+  function showReprintModal(s) {
+    document.getElementById('reprint-subtitle').textContent =
+      `${reprints.length} bib${reprints.length === 1 ? '' : 's'} need manual reprinting`;
+    document.getElementById('reprint-list').innerHTML =
+      reprints.map(b => `<div>${esc(b)}</div>`).join('');
+    document.getElementById('reprint-modal').classList.add('show');
+  }
+
+  function closeModal() {
+    document.getElementById('reprint-modal').classList.remove('show');
+  }
+
+  function copyReprint() {
+    navigator.clipboard.writeText(reprints.join('\n'));
+  }
+
+  // ── Import CSV ───────────────────────────────────────────────────────────────
+  function importCSV() {
+    const path = document.getElementById('import-path').value.trim();
+    if (!path) return;
+    socket.emit('import', { path });
+  }
+
+  document.getElementById('reprint-modal').addEventListener('click', e => {
+    if (e.target === e.currentTarget) closeModal();
+  });
+</script>
+</body>
+</html>
