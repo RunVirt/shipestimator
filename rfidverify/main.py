@@ -169,13 +169,13 @@ class CaenReader:
         self.dll_path = dll_path
         self.debug    = debug
         self._lib: Optional[ctypes.CDLL] = None
-        self._handle  = ctypes.c_int32(-1)   # easyReader handle is int32
+        self._handle  = ctypes.c_void_p(0)   # NULL / uninitialised
         self._running = False
         self._callback: Optional[Callable] = None
 
     @property
     def connected(self) -> bool:
-        return self._lib is not None and self._handle.value >= 0
+        return self._lib is not None and bool(self._handle.value)
 
     def connect(self) -> bool:
         if not hasattr(ctypes, "WinDLL"):
@@ -208,7 +208,7 @@ class CaenReader:
             self._lib.CAENRFID_Init.argtypes = [
                 ctypes.c_int,
                 ctypes.c_void_p,
-                ctypes.POINTER(ctypes.c_int32),
+                ctypes.POINTER(ctypes.c_void_p),
             ]
         except AttributeError:
             logging.error("CAENRFID_Init not found in DLL")
@@ -219,7 +219,7 @@ class CaenReader:
         ret = self._lib.CAENRFID_Init(0, port_bytes, ctypes.byref(self._handle))
         if ret != 0:
             logging.warning("CAENRFID_Init RS232(%s) returned %d, trying USB direct...", self.port, ret)
-            self._handle = ctypes.c_int32(-1)
+            self._handle = ctypes.c_void_p(0)
             ret = self._lib.CAENRFID_Init(3, None, ctypes.byref(self._handle))
 
         if ret != 0:
@@ -232,14 +232,14 @@ class CaenReader:
 
     def disconnect(self):
         self._running = False
-        if self._lib and self._handle.value >= 0:
+        if self._lib and self._handle.value:
             try:
                 self._lib.CAENRFID_End.restype  = ctypes.c_int
-                self._lib.CAENRFID_End.argtypes = [ctypes.c_int32]
+                self._lib.CAENRFID_End.argtypes = [ctypes.c_void_p]
                 self._lib.CAENRFID_End(self._handle)
             except Exception:
                 pass
-        self._handle = ctypes.c_int32(-1)
+        self._handle = ctypes.c_void_p(0)
         self._lib    = None
 
     def start_inventory(self, callback: Callable):
@@ -306,7 +306,7 @@ class CaenReader:
         try:
             fn = self._lib.CAENRFID_SetPower
             fn.restype  = ctypes.c_int
-            fn.argtypes = [ctypes.c_int32, ctypes.c_int]
+            fn.argtypes = [ctypes.c_void_p, ctypes.c_int]
             fn(self._handle, self.power)
             logging.info("RF power set to %d dBm", self.power)
         except AttributeError:
@@ -316,7 +316,7 @@ class CaenReader:
         try:
             self._lib.CAENRFID_InventoryTag.restype  = ctypes.c_int
             self._lib.CAENRFID_InventoryTag.argtypes = [
-                ctypes.c_int32,                      # Handle
+                ctypes.c_void_p,                     # Handle
                 ctypes.c_char_p,                     # SourceName
                 ctypes.c_char_p,                     # Mask (NULL = no filter)
                 ctypes.c_ubyte,                      # MaskLength

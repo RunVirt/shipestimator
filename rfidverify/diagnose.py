@@ -287,13 +287,13 @@ tags_found = 0
 for dll_path, lib, api_style in loadable:
     print(f"\nTrying: {dll_path}  (API: {api_style})")
 
-        # easyReader API: CAENRFID_Init(int connType, void* param, int* handle)
+        # easyReader API: CAENRFID_Init(int connType, void* param, void** handle)
     # connType 0 = RS232 (use for USB virtual COM port like COM3)
     # connType 3 = USB direct
-    handle = ctypes.c_int32(-1)
+    handle = ctypes.c_void_p(0)
     try:
         lib.CAENRFID_Init.restype  = ctypes.c_int
-        lib.CAENRFID_Init.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32)]
+        lib.CAENRFID_Init.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
 
         print(f"  Trying CAENRFID_Init RS232 on {COM_PORT}...")
         com = ctypes.c_char_p(COM_PORT.encode())
@@ -302,7 +302,7 @@ for dll_path, lib, api_style in loadable:
 
         if ret != 0:
             print(f"  Trying CAENRFID_Init USB direct...")
-            handle = ctypes.c_int32(-1)
+            handle = ctypes.c_void_p(0)
             ret = lib.CAENRFID_Init(3, None, ctypes.byref(handle))
             print(f"    returned {ret}, handle={handle.value}")
 
@@ -321,7 +321,7 @@ for dll_path, lib, api_style in loadable:
     try:
         lib.CAENRFID_InventoryTag.restype  = ctypes.c_int
         lib.CAENRFID_InventoryTag.argtypes = [
-            ctypes.c_int32,                       # Handle
+            ctypes.c_void_p,                      # Handle
             ctypes.c_char_p,                      # SourceName
             ctypes.c_char_p,                      # Mask (NULL = no filter)
             ctypes.c_ubyte,                       # MaskLength
@@ -364,7 +364,7 @@ for dll_path, lib, api_style in loadable:
 
     try:
         lib.CAENRFID_End.restype  = ctypes.c_int
-        lib.CAENRFID_End.argtypes = [ctypes.c_int32]
+        lib.CAENRFID_End.argtypes = [ctypes.c_void_p]
         lib.CAENRFID_End(handle)
         print("\n  Disconnected OK")
     except AttributeError:
