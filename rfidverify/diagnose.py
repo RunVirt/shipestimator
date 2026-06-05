@@ -1,89 +1,83 @@
 #!/usr/bin/env python3
 """
-CAEN R1210IX diagnostic tool.
-Opens the COM port, sends each command, and dumps exactly what comes back.
-Run this and paste the output so the protocol can be verified.
+CAEN R1210IX - Simple listen diagnostic.
+Just opens the COM port and dumps whatever the reader sends.
+No commands sent - safe to run without knowing the protocol.
 """
 
 import json
-import struct
 import time
+import sys
 from pathlib import Path
 
 import serial
+import serial.tools.list_ports
 
-# ── Load settings ──────────────────────────────────────────────────────────────
+# ── Show all available COM ports first ────────────────────────────────────────
+print("=" * 60)
+print("Available COM ports on this PC:")
+ports = list(serial.tools.list_ports.comports())
+if ports:
+    for p in ports:
+        print(f"  {p.device:10s}  {p.description}")
+else:
+    print("  (none found)")
+print("=" * 60)
+
+# ── Load settings ─────────────────────────────────────────────────────────────
 s = json.loads((Path(__file__).parent / "settings.json").read_text())
 PORT = s.get("comPort", "COM3")
 BAUD = s.get("baudRate", 115200)
 
-STX, ETX = 0x02, 0x03
-
-def crc16(data: bytes) -> int:
-    crc = 0xFFFF
-    for b in data:
-        crc ^= b
-        for _ in range(8):
-            crc = (crc >> 1) ^ 0xA001 if crc & 1 else crc >> 1
-    return crc
-
-def frame(cmd: int, data: bytes = b"") -> bytes:
-    payload = bytes([cmd]) + data
-    body    = struct.pack("<H", len(payload)) + payload
-    return bytes([STX]) + body + struct.pack("<H", crc16(body)) + bytes([ETX])
-
-def recv(ser: serial.Serial, wait=1.5) -> bytes:
-    buf = b""
-    deadline = time.time() + wait
-    while time.time() < deadline:
-        chunk = ser.read(256)
-        if chunk:
-            buf += chunk
-            deadline = time.time() + 0.4   # keep reading if data arrives
-    return buf
-
-def show(label: str, data: bytes):
-    if data:
-        print(f"  ← {label} ({len(data)} bytes)")
-        print(f"    HEX : {data.hex()}")
-        print(f"    TEXT: {data!r}")
-    else:
-        print(f"  ← {label}: (nothing)")
-
-print("=" * 60)
-print(f"CAEN R1210IX Diagnostic  —  {PORT} @ {BAUD} baud")
-print("=" * 60)
-
+# ── Try opening the port ──────────────────────────────────────────────────────
+print(f"\nTrying to open {PORT} at {BAUD} baud...")
 try:
     ser = serial.Serial(PORT, BAUD, timeout=0.1)
-    print(f"Port opened OK\n")
+    print(f"SUCCESS - {PORT} is open\n")
 except serial.SerialException as e:
-    print(f"FAILED to open {PORT}: {e}")
-    raise SystemExit(1)
+    print(f"\nFAILED: {e}")
+    print("\nMost likely fix: close the CAEN software completely, then try again.")
+    sys.exit(1)
 
-steps = [
-    ("Open Reader",      frame(0x01)),
-    ("Set GEN2 proto",   frame(0x03, b"\x00")),
-    ("Set power 30dBm",  frame(0x04, struct.pack("<H", 3000))),
-    ("Start inventory",  frame(0x05)),
-]
+# ── Listen for 10 seconds without sending anything ───────────────────────────
+print("Listening for 10 seconds without sending any commands...")
+print("(If the reader sends anything on startup, it will appear below)\n")
 
-for label, cmd in steps:
-    print(f"→ {label}:  {cmd.hex()}")
-    ser.write(cmd)
-    resp = recv(ser)
-    show("response", resp)
-    time.sleep(0.2)
+buf = b""
+deadline = time.time() + 10
+last_print = time.time()
 
-print("\nListening for tag reads for 10 seconds — wave a tag over the reader now...")
-tag_data = recv(ser, wait=10)
-show("Tag reads", tag_data)
+while time.time() < deadline:
+    chunk = ser.read(256)
+    if chunk:
+        buf += chunk
+        print(f"  RECEIVED ({len(chunk)} bytes): {chunk.hex()}")
+        print(f"  AS TEXT : {chunk!r}")
+        print()
 
-print("\n→ Stop inventory:", frame(0x06).hex())
-ser.write(frame(0x06))
-show("response", recv(ser))
+# ── Try baud rates if nothing received ───────────────────────────────────────
+if not buf:
+    print("Nothing received at 115200 baud.")
+    print("\nTrying other common baud rates...\n")
+    ser.close()
 
-ser.close()
+    for baud in [9600, 19200, 38400, 57600]:
+        print(f"  Trying {baud} baud...")
+        try:
+            ser = serial.Serial(PORT, baud, timeout=0.1)
+            time.sleep(0.5)
+            chunk = ser.read(256)
+            if chunk:
+                print(f"  GOT DATA at {baud} baud: {chunk.hex()}")
+                print(f"  AS TEXT: {chunk!r}")
+            else:
+                print(f"  Nothing at {baud} baud")
+            ser.close()
+        except serial.SerialException as e:
+            print(f"  Error: {e}")
+else:
+    ser.close()
+
 print("\n" + "=" * 60)
-print("Done — paste this entire output for protocol verification.")
+print("Done - paste this full output so the protocol can be identified.")
 print("=" * 60)
