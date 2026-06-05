@@ -8,5 +8,6 @@
   "rssiThreshold": -70,
   "webPort": 8765,
   "dllPath": "",
+  "readerBackend": "serial",
   "debug": false
 }

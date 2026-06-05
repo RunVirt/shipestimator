@@ -38,6 +38,9 @@ DEFAULT_SETTINGS = {
     "rssiThreshold": -70,
     "webPort":       8765,
     "dllPath":       "",
+    # "dll"    – use CAENRFIDLib.dll (crashes on RS232 without CAEN USB driver)
+    # "serial" – pure-Python pyserial implementation (recommended)
+    "readerBackend": "serial",
     "debug":         False,
 }
 
@@ -379,17 +382,28 @@ class CaenReader:
 
 # ─── Verification Runner ──────────────────────────────────────────────────────
 
+def _make_reader(settings: dict):
+    """Return the appropriate reader instance based on settings['readerBackend']."""
+    backend = settings.get("readerBackend", "serial").lower()
+    port    = settings["comPort"]
+    power   = settings.get("readPower", 30)
+    debug   = settings.get("debug", False)
+
+    if backend == "dll":
+        return CaenReader(port=port, power=power,
+                          dll_path=settings.get("dllPath", ""), debug=debug)
+
+    # "serial" (default) — pure-Python pyserial, no DLL needed
+    from serial_reader import CaenSerialReader
+    return CaenSerialReader(port=port, power=power, debug=debug)
+
+
 class VerificationRunner:
     def __init__(self, settings: dict, db: EncodingDatabase, socketio: SocketIO):
         self._settings = settings
         self._db       = db
         self._sio      = socketio
-        self._reader   = CaenReader(
-            port     = settings["comPort"],
-            power    = settings.get("readPower", 30),
-            dll_path = settings.get("dllPath", ""),
-            debug    = settings.get("debug", False),
-        )
+        self._reader   = _make_reader(settings)
         self._tracker  = FailedBibTracker()
         self._running  = False
         self._paused   = False
@@ -632,7 +646,7 @@ def on_resume(data=None):
 def on_settings(data: dict):
     global _settings, _db
     allowed = {"comPort", "baudRate", "readPower", "dataDir", "filePrefix",
-               "encodingDb", "rssiThreshold", "webPort", "dllPath"}
+               "encodingDb", "rssiThreshold", "webPort", "dllPath", "readerBackend"}
     for k, v in data.items():
         if k in allowed:
             _settings[k] = v
