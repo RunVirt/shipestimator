@@ -149,16 +149,19 @@ class FailedBibTracker:
 
 class CaenReader:
     """
-    CAEN R1210IX Smart Tray Reader via CAENRFIDLib.dll (SDK 5.0.0, 64-bit).
+    CAEN R1210IX Smart Tray Reader via CAENRFIDLib.dll (easyReader API, x64).
 
-    Polls CAENRFIDLib_InventoryTag in a background thread and calls
+    Uses the older CAENRFID_ API:
+      CAENRFID_Init(connType, port, &handle)   — connect (RS232=0, USB=3)
+      CAENRFID_End(handle)                      — disconnect
+      CAENRFID_InventoryTag(handle, source, mask, maskLen, pos, &tags, &count)
+      CAENRFID_FreeTagsMemory(tags)             — release DLL-allocated tag list
+
+    Polls inventory in a background thread and calls
     tag_callback(epc: str, rssi_dbm: int, err: int) for every tag read.
-
-    Set 'dllPath' in settings.json to the 64-bit CAENRFIDLib.dll if
-    auto-detection fails (see connect() log output for details).
     """
 
-    _EOF = -13  # CAENRFID_EOF — no tags in this scan cycle
+    _EOF = -13  # CAENRFID_EOF — no tags in this cycle
 
     def __init__(self, port: str, power: int, dll_path: str = "", debug: bool = False):
         self.port     = port
@@ -166,13 +169,13 @@ class CaenReader:
         self.dll_path = dll_path
         self.debug    = debug
         self._lib: Optional[ctypes.CDLL] = None
-        self._handle  = ctypes.c_void_p(0)
+        self._handle  = ctypes.c_int32(-1)   # easyReader handle is int32
         self._running = False
         self._callback: Optional[Callable] = None
 
     @property
     def connected(self) -> bool:
-        return self._lib is not None and bool(self._handle.value)
+        return self._lib is not None and self._handle.value >= 0
 
     def connect(self) -> bool:
         if not hasattr(ctypes, "WinDLL"):
@@ -182,14 +185,12 @@ class CaenReader:
         dll = self._find_dll()
         if not dll:
             logging.error(
-                "CAENRFIDLib.dll not found. Add \"dllPath\" to settings.json "
-                "with the full path to the 64-bit CAENRFIDLib.dll, e.g.: "
-                r'"dllPath": "C:\\path\\to\\64bit\\CAENRFIDLib.dll"'
+                "CAENRFIDLib.dll not found. Set \"dllPath\" in settings.json to "
+                r'"C:\\Users\\tyler\\OneDrive\\Desktop\\caen-rfid-websocket\\CAENRFIDLib.dll"'
             )
             return False
 
         logging.info("Loading DLL: %s", dll)
-        # Add the DLL's directory so Windows can find its sibling dependencies.
         dll_dir = str(Path(dll).parent)
         if hasattr(os, "add_dll_directory"):
             os.add_dll_directory(dll_dir)
@@ -199,37 +200,46 @@ class CaenReader:
             logging.error("Failed to load DLL: %s", e)
             return False
 
+        # CAENRFID_Init(int connType, void* pParam, int* pHandle)
+        # connType 0 = RS232 (use for USB virtual COM port like COM3)
+        # connType 3 = USB  (direct USB, no COM port)
         try:
-            self._lib.CAENRFIDLib_Connect.restype  = ctypes.c_int
-            self._lib.CAENRFIDLib_Connect.argtypes = [
-                ctypes.c_char_p,
-                ctypes.POINTER(ctypes.c_void_p),
+            self._lib.CAENRFID_Init.restype  = ctypes.c_int
+            self._lib.CAENRFID_Init.argtypes = [
+                ctypes.c_int,
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_int32),
             ]
         except AttributeError:
-            logging.error("CAENRFIDLib_Connect not found — wrong DLL version or 32-bit DLL?")
+            logging.error("CAENRFID_Init not found in DLL")
             return False
 
-        ret = self._lib.CAENRFIDLib_Connect(
-            self.port.encode(), ctypes.byref(self._handle)
-        )
+        # R1210IX on USB shows as a virtual COM port → RS232 connection type
+        port_bytes = ctypes.c_char_p(self.port.encode())
+        ret = self._lib.CAENRFID_Init(0, port_bytes, ctypes.byref(self._handle))
         if ret != 0:
-            logging.error("CAENRFIDLib_Connect('%s') returned %d", self.port, ret)
+            logging.warning("CAENRFID_Init RS232(%s) returned %d, trying USB direct...", self.port, ret)
+            self._handle = ctypes.c_int32(-1)
+            ret = self._lib.CAENRFID_Init(3, None, ctypes.byref(self._handle))
+
+        if ret != 0:
+            logging.error("CAENRFID_Init failed (code %d)", ret)
             return False
 
-        logging.info("Connected to reader on %s", self.port)
+        logging.info("Connected to reader on %s (handle=%d)", self.port, self._handle.value)
         self._try_set_power()
         return True
 
     def disconnect(self):
         self._running = False
-        if self._lib and self._handle.value:
+        if self._lib and self._handle.value >= 0:
             try:
-                self._lib.CAENRFIDLib_Disconnect.restype  = ctypes.c_int
-                self._lib.CAENRFIDLib_Disconnect.argtypes = [ctypes.c_void_p]
-                self._lib.CAENRFIDLib_Disconnect(self._handle)
+                self._lib.CAENRFID_End.restype  = ctypes.c_int
+                self._lib.CAENRFID_End.argtypes = [ctypes.c_int32]
+                self._lib.CAENRFID_End(self._handle)
             except Exception:
                 pass
-        self._handle = ctypes.c_void_p(0)
+        self._handle = ctypes.c_int32(-1)
         self._lib    = None
 
     def start_inventory(self, callback: Callable):
@@ -252,10 +262,7 @@ class CaenReader:
             r"C:\Program Files (x86)\CAEN\**\CAENRFIDLib.dll",
             r"C:\CAEN\**\CAENRFIDLib.dll",
             r"C:\Windows\System32\CAENRFIDLib.dll",
-            r"C:\Windows\SysWOW64\CAENRFIDLib.dll",
         ]
-
-        # Also search the current user's Desktop and OneDrive Desktop
         user = os.environ.get("USERNAME") or os.environ.get("USER", "")
         if user:
             patterns += [
@@ -264,43 +271,61 @@ class CaenReader:
                 rf"C:\Users\{user}\OneDrive - *\Desktop\**\CAENRFIDLib.dll",
             ]
 
+        candidates = []
         for pat in patterns:
             try:
-                hits = glob.glob(pat, recursive=True)
+                candidates.extend(glob.glob(pat, recursive=True))
+            except Exception:
+                pass
+        script_dir = Path(__file__).parent
+        for d in (script_dir, script_dir.parent):
+            candidates.extend(str(f) for f in d.rglob("CAENRFIDLib.dll"))
+
+        # Prefer x64 DLLs — skip 32-bit ones (they fail with WinError 193)
+        from struct import unpack_from
+        for path in candidates:
+            try:
+                data = Path(path).read_bytes()
+                if data[:2] != b"MZ":
+                    continue
+                pe_off = unpack_from("<I", data, 0x3C)[0]
+                machine = unpack_from("<H", data, pe_off + 4)[0]
+                if machine == 0x8664:   # IMAGE_FILE_MACHINE_AMD64
+                    logging.info("Auto-detected 64-bit DLL: %s", path)
+                    return path
             except Exception:
                 continue
-            if hits:
-                logging.info("Auto-detected DLL: %s", hits[0])
-                return hits[0]
 
-        # Check directories near this script (if DLL was copied locally)
-        script_dir = Path(__file__).parent
-        for search_dir in (script_dir, script_dir.parent):
-            for f in search_dir.rglob("CAENRFIDLib.dll"):
-                return str(f)
-
+        # Fall back to first loadable candidate
+        for path in candidates:
+            if os.path.exists(path):
+                return path
         return ""
 
     def _try_set_power(self):
         try:
-            fn = self._lib.CAENRFIDLib_SetSourcePower
+            fn = self._lib.CAENRFID_SetPower
             fn.restype  = ctypes.c_int
-            fn.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
-            fn(self._handle, b"Source_0", self.power)
+            fn.argtypes = [ctypes.c_int32, ctypes.c_int]
+            fn(self._handle, self.power)
             logging.info("RF power set to %d dBm", self.power)
         except AttributeError:
-            pass  # Not critical; reader retains last-used power setting
+            pass
 
     def _poll_loop(self):
         try:
-            self._lib.CAENRFIDLib_InventoryTag.restype  = ctypes.c_int
-            self._lib.CAENRFIDLib_InventoryTag.argtypes = [
-                ctypes.c_void_p,
-                ctypes.POINTER(ctypes.c_void_p),
-                ctypes.POINTER(ctypes.c_uint16),
+            self._lib.CAENRFID_InventoryTag.restype  = ctypes.c_int
+            self._lib.CAENRFID_InventoryTag.argtypes = [
+                ctypes.c_int32,                      # Handle
+                ctypes.c_char_p,                     # SourceName
+                ctypes.c_char_p,                     # Mask (NULL = no filter)
+                ctypes.c_ubyte,                      # MaskLength
+                ctypes.c_ubyte,                      # MaskPosition
+                ctypes.POINTER(ctypes.c_void_p),     # CAENRFIDTag** (DLL allocates)
+                ctypes.POINTER(ctypes.c_uint16),     # TagCount*
             ]
         except AttributeError:
-            logging.error("CAENRFIDLib_InventoryTag not found in DLL")
+            logging.error("CAENRFID_InventoryTag not found in DLL")
             self._running = False
             return
 
@@ -308,14 +333,24 @@ class CaenReader:
             tags_ptr = ctypes.c_void_p(0)
             count    = ctypes.c_uint16(0)
 
-            ret = self._lib.CAENRFIDLib_InventoryTag(
+            ret = self._lib.CAENRFID_InventoryTag(
                 self._handle,
+                b"Source_0",   # default source name on CAEN readers
+                None,          # no EPC mask filter
+                0,             # MaskLength
+                0,             # MaskPosition
                 ctypes.byref(tags_ptr),
                 ctypes.byref(count),
             )
 
             if ret == 0 and count.value > 0 and tags_ptr.value:
                 self._process_tags(tags_ptr, count.value)
+                try:
+                    self._lib.CAENRFID_FreeTagsMemory.restype  = ctypes.c_int
+                    self._lib.CAENRFID_FreeTagsMemory.argtypes = [ctypes.c_void_p]
+                    self._lib.CAENRFID_FreeTagsMemory(tags_ptr)
+                except AttributeError:
+                    pass
             elif ret not in (0, self._EOF):
                 if self.debug:
                     print(f"InventoryTag returned {ret}", flush=True)

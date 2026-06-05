@@ -287,40 +287,31 @@ tags_found = 0
 for dll_path, lib, api_style in loadable:
     print(f"\nTrying: {dll_path}  (API: {api_style})")
 
-    if api_style in ("new", "unknown"):
-        # SDK 5.0 API: CAENRFIDLib_Connect(char* address, void** pHandle)
-        handle = ctypes.c_void_p(0)
-        try:
-            lib.CAENRFIDLib_Connect.restype  = ctypes.c_int
-            lib.CAENRFIDLib_Connect.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p)]
-            ret = lib.CAENRFIDLib_Connect(COM_PORT.encode(), ctypes.byref(handle))
-            print(f"  CAENRFIDLib_Connect returned {ret}, handle={handle.value}")
-            if ret == 0:
-                connected = True
-        except AttributeError:
-            print("  CAENRFIDLib_Connect not available, trying old API...")
-            api_style = "old"
+        # easyReader API: CAENRFID_Init(int connType, void* param, int* handle)
+    # connType 0 = RS232 (use for USB virtual COM port like COM3)
+    # connType 3 = USB direct
+    handle = ctypes.c_int32(-1)
+    try:
+        lib.CAENRFID_Init.restype  = ctypes.c_int
+        lib.CAENRFID_Init.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32)]
 
-    if not connected and api_style == "old":
-        # Older API: CAENRFID_Connect(int connType, void* param, int* handle)
-        # connType: 0=USB, 1=RS232, 2=TCP/IP
-        old_handle = ctypes.c_int32(-1)
-        try:
-            lib.CAENRFID_Connect.restype  = ctypes.c_int
-            lib.CAENRFID_Connect.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32)]
-            # Try USB (type 0)
-            ret = lib.CAENRFID_Connect(0, None, ctypes.byref(old_handle))
-            print(f"  CAENRFID_Connect(USB) returned {ret}, handle={old_handle.value}")
-            if ret != 0:
-                # Try RS232 (type 1)
-                com = ctypes.c_char_p(COM_PORT.encode())
-                ret = lib.CAENRFID_Connect(1, com, ctypes.byref(old_handle))
-                print(f"  CAENRFID_Connect(RS232) returned {ret}, handle={old_handle.value}")
-            if ret == 0:
-                print("  Connected with old API!")
-                print("  NOTE: main.py uses SDK 5.0 API — this DLL may need different code.")
-        except AttributeError:
-            print("  CAENRFID_Connect not available either")
+        print(f"  Trying CAENRFID_Init RS232 on {COM_PORT}...")
+        com = ctypes.c_char_p(COM_PORT.encode())
+        ret = lib.CAENRFID_Init(0, com, ctypes.byref(handle))
+        print(f"    returned {ret}, handle={handle.value}")
+
+        if ret != 0:
+            print(f"  Trying CAENRFID_Init USB direct...")
+            handle = ctypes.c_int32(-1)
+            ret = lib.CAENRFID_Init(3, None, ctypes.byref(handle))
+            print(f"    returned {ret}, handle={handle.value}")
+
+        if ret == 0:
+            connected = True
+        else:
+            print(f"  Could not connect (last code: {ret})")
+    except AttributeError:
+        print("  CAENRFID_Init not available in this DLL")
 
     if not connected:
         continue
@@ -328,20 +319,27 @@ for dll_path, lib, api_style in loadable:
     # ── Run inventory ──────────────────────────────────────────────────────────
     print("\n  Running inventory — wave a tag over the reader now...")
     try:
-        lib.CAENRFIDLib_InventoryTag.restype  = ctypes.c_int
-        lib.CAENRFIDLib_InventoryTag.argtypes = [
-            ctypes.c_void_p,
-            ctypes.POINTER(ctypes.c_void_p),
-            ctypes.POINTER(ctypes.c_uint16),
+        lib.CAENRFID_InventoryTag.restype  = ctypes.c_int
+        lib.CAENRFID_InventoryTag.argtypes = [
+            ctypes.c_int32,                       # Handle
+            ctypes.c_char_p,                      # SourceName
+            ctypes.c_char_p,                      # Mask (NULL = no filter)
+            ctypes.c_ubyte,                       # MaskLength
+            ctypes.c_ubyte,                       # MaskPosition
+            ctypes.POINTER(ctypes.c_void_p),      # CAENRFIDTag** (DLL allocates)
+            ctypes.POINTER(ctypes.c_uint16),      # TagCount*
         ]
     except AttributeError:
-        print("  CAENRFIDLib_InventoryTag not found")
+        print("  CAENRFID_InventoryTag not found")
         break
 
     for attempt in range(10):
         tags_ptr = ctypes.c_void_p(0)
         count    = ctypes.c_uint16(0)
-        ret = lib.CAENRFIDLib_InventoryTag(handle, ctypes.byref(tags_ptr), ctypes.byref(count))
+        ret = lib.CAENRFID_InventoryTag(
+            handle, b"Source_0", None, 0, 0,
+            ctypes.byref(tags_ptr), ctypes.byref(count)
+        )
         print(f"  Attempt {attempt+1}: ret={ret}  count={count.value}", end="")
 
         if ret == 0 and count.value > 0 and tags_ptr.value:
@@ -357,11 +355,17 @@ for dll_path, lib, api_style in loadable:
             print("  (no tags)" if ret in (0, -13) else f"  (error {ret})")
         time.sleep(0.5)
 
-    # Disconnect
+    # Free last tag allocation and disconnect
     try:
-        lib.CAENRFIDLib_Disconnect.restype  = ctypes.c_int
-        lib.CAENRFIDLib_Disconnect.argtypes = [ctypes.c_void_p]
-        lib.CAENRFIDLib_Disconnect(handle)
+        lib.CAENRFID_FreeTagsMemory.restype  = ctypes.c_int
+        lib.CAENRFID_FreeTagsMemory.argtypes = [ctypes.c_void_p]
+    except AttributeError:
+        pass
+
+    try:
+        lib.CAENRFID_End.restype  = ctypes.c_int
+        lib.CAENRFID_End.argtypes = [ctypes.c_int32]
+        lib.CAENRFID_End(handle)
         print("\n  Disconnected OK")
     except AttributeError:
         pass
