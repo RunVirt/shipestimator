@@ -1,162 +1,200 @@
 #!/usr/bin/env python3
 """
-CAEN R1210IX Smart Tray — pure-Python serial reader (no DLL needed).
+CAEN R1210IX Smart Tray — pure-Python serial reader using CAEN LightCLib protocol.
 
-Implements the CAEN easyReader binary serial protocol over a virtual COM port.
-Use this as a drop-in replacement for the ctypes/DLL approach when the DLL
-crashes (access violation on RS232 init) or the CAEN USB driver is not installed.
+Implements the exact protocol from SDK source files:
+  SDK_5_0_0/LightCLib/SRC/IO_Light.c + Protocol_Light.h
 
-Frame format  (big-endian):
-  [STX=0x02][LEN_HI][LEN_LO][CMD][DATA...][ETX=0x03][CRC_HI][CRC_LO]
+Frame format (all big-endian, NO STX/ETX/CRC):
+  Request:  TxVer=0x8001(2) | CmdID_seq(2) | VendorID=21336(4) | TotalLen(2) | AVPs
+  Response: TxVer=0x0001(2) | CmdID_seq(2) | VendorID=21336(4) | TotalLen(2) | AVPs
 
-  LEN  = number of bytes from CMD through last DATA byte (uint16 BE)
-  CRC  = CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF) over
-         [LEN_HI, LEN_LO, CMD, DATA...]
-
-Response frames have the same format; the response CMD = request CMD | 0x80.
+AVP: Reserved=0(2) | TotalLen=6+n(2) | Type(2) | Value(n)
 """
 
 import logging
 import struct
 import threading
 import time
-from typing import Callable, Iterator, Optional, Tuple
+from typing import Callable, Optional
 
 import serial
 
 logger = logging.getLogger(__name__)
 
-# ─── Protocol constants ────────────────────────────────────────────────────────
+# Protocol constants
+CAEN_VENDOR  = 21336       # 0x00005358
+HEADER_LEN   = 10
+AVP_HEADLEN  = 6
+UART_ABORT   = 0xAB
 
-STX = 0x02
-ETX = 0x03
+# AVP types
+AVP_COMMAND        = 0x01
+AVP_RESULT_CODE    = 0x02
+AVP_TAGIDLEN       = 0x0F
+AVP_TIMESTAMP      = 0x10
+AVP_TAGID          = 0x11
+AVP_TAGTYPE        = 0x12
+AVP_READPOINT_NAME = 0x22
+AVP_BITMASK        = 0x67
+AVP_READERINFO     = 0x76
+AVP_RSSI           = 0x7A
+AVP_GETFWRELEASE   = 0x5C
+AVP_SOURCE_NAME    = 0xFB
 
-# Host → reader commands
-CMD_READER_INFO   = 0x01   # No params; response: firmware/model string
-CMD_INVENTORY     = 0x03   # Params: see _inv_frame(); response: tag list
-CMD_SET_POWER     = 0x07   # Params: [power_dBm: uint8]; response: ACK
+# Command values (uint16 inside AVP_COMMAND)
+CMD_INVENTORY    = 0x13
+CMD_GETFWRELEASE = 0x7C
+CMD_GETRDRINFO   = 0x9E
 
-# Reader → host response = CMD | 0x80
-RESP_READER_INFO  = CMD_READER_INFO  | 0x80   # 0x81
-RESP_INVENTORY    = CMD_INVENTORY    | 0x80   # 0x83
-RESP_SET_POWER    = CMD_SET_POWER    | 0x80   # 0x87
-RESP_ERROR        = 0xFF
-
-
-# ─── CRC ──────────────────────────────────────────────────────────────────────
-
-def _crc16(data: bytes) -> int:
-    """CRC-16/CCITT-FALSE: polynomial 0x1021, initial value 0xFFFF."""
-    crc = 0xFFFF
-    for b in data:
-        crc ^= b << 8
-        for _ in range(8):
-            crc = (crc << 1) ^ 0x1021 if crc & 0x8000 else crc << 1
-        crc &= 0xFFFF
-    return crc
-
-
-# ─── Frame builder ─────────────────────────────────────────────────────────────
-
-def build_frame(cmd: int, data: bytes = b"") -> bytes:
-    payload = bytes([cmd]) + data
-    inner   = struct.pack(">H", len(payload)) + payload   # LEN + CMD + DATA
-    crc     = struct.pack(">H", _crc16(inner))
-    return bytes([STX]) + inner + bytes([ETX]) + crc
+# Inventory flags (uint16 inside AVP_BITMASK)
+FLAG_RSSI      = 0x0001
+FLAG_FRAMED    = 0x0002
+FLAG_CONTINUOS = 0x0004
 
 
-# ─── Frame parser ──────────────────────────────────────────────────────────────
-
-def _iter_frames(buf: bytearray) -> Iterator[Tuple[int, bytes]]:
-    """
-    Yield (cmd, data) for each complete, CRC-valid frame found in buf.
-    Consumed bytes are deleted from buf in place.
-    """
-    while len(buf) >= 7:          # minimum: STX + 2 LEN + 1 CMD + ETX + 2 CRC
-        if buf[0] != STX:
-            del buf[0]
-            continue
-        n     = struct.unpack_from(">H", buf, 1)[0]   # payload length
-        total = 6 + n                                   # full frame length
-        if len(buf) < total:
-            break
-        etx_idx = 3 + n
-        if buf[etx_idx] != ETX:
-            del buf[0]
-            continue
-        inner   = bytes(buf[1 : 3 + n])               # LEN_HI LEN_LO CMD DATA
-        exp_crc = _crc16(inner)
-        act_crc = struct.unpack_from(">H", buf, etx_idx + 1)[0]
-        if exp_crc != act_crc:
-            del buf[0]
-            continue
-        cmd  = buf[3]
-        data = bytes(buf[4 : 3 + n])                  # DATA only (may be empty)
-        del buf[:total]
-        yield cmd, data
+def _u16(v): return struct.pack(">H", v & 0xFFFF)
+def _u32(v): return struct.pack(">I", v & 0xFFFFFFFF)
+def _gu16(b, off=0): return struct.unpack_from(">H", b, off)[0]
+def _gu32(b, off=0): return struct.unpack_from(">I", b, off)[0]
 
 
-# ─── Inventory frame variants ──────────────────────────────────────────────────
-#
-# The exact inventory command parameters differ slightly between firmware versions.
-# We cycle through the three most likely encodings until one produces tag reads.
+# ─── Frame builders ───────────────────────────────────────────────────────────
 
-def _inv_frames():
-    """Yield successive inventory frame candidates to probe."""
-    # Variant A: no parameters (simplest, some firmware versions)
-    yield build_frame(CMD_INVENTORY)
-    # Variant B: source index 0 as single byte
-    yield build_frame(CMD_INVENTORY, bytes([0x00]))
-    # Variant C: source name "Source_0" as length-prefixed Pascal string
-    src = b"Source_0"
-    yield build_frame(CMD_INVENTORY, bytes([len(src)]) + src)
-    # Variant D: source name + null mask (length 0)
-    yield build_frame(CMD_INVENTORY, bytes([len(src)]) + src + b"\x00\x00")
+def _avp_u16(avp_type, value):
+    return _u16(0) + _u16(AVP_HEADLEN + 2) + _u16(avp_type) + _u16(value)
 
 
-# ─── Inventory tag parser ──────────────────────────────────────────────────────
+def _avp_str(avp_type, s):
+    b = s.encode("ascii") + b"\x00"
+    return _u16(0) + _u16(AVP_HEADLEN + len(b)) + _u16(avp_type) + b
 
-def _parse_inv_data(data: bytes) -> Iterator[Tuple[str, int]]:
-    """
-    Yield (epc_hex_upper, rssi_dbm) for each tag in a RESP_INVENTORY payload.
 
-    Expected payload layout:
-      [tag_count: uint16 BE]
-      for each tag:
-        [epc_byte_len: uint8]
-        [epc: epc_byte_len bytes]
-        [rssi: int16 BE, in dBm]
-        (remaining fields per-tag are skipped if present)
-    """
-    if len(data) < 2:
-        return
+class _Seq:
+    def __init__(self): self.n = 0
+    def next(self):
+        v = self.n; self.n = (self.n + 1) & 0xFFFF; return v
+
+
+def _build_frame(avps: bytes, seq: _Seq) -> bytes:
+    total = HEADER_LEN + len(avps)
+    cid = seq.next()
+    hdr = _u16(0x8001) + _u16(cid) + _u32(CAEN_VENDOR) + _u16(total)
+    return hdr + avps, cid
+
+
+def make_getrdrinfo(seq): return _build_frame(_avp_u16(AVP_COMMAND, CMD_GETRDRINFO), seq)
+def make_getfwrelease(seq): return _build_frame(_avp_u16(AVP_COMMAND, CMD_GETFWRELEASE), seq)
+
+
+def make_inventory(seq, source="Source_0"):
+    avps = (_avp_u16(AVP_COMMAND, CMD_INVENTORY) +
+            _avp_str(AVP_SOURCE_NAME, source) +
+            _avp_u16(AVP_BITMASK, FLAG_RSSI))
+    return _build_frame(avps, seq)
+
+
+# ─── Serial I/O helpers ───────────────────────────────────────────────────────
+
+def _read_exactly(ser: serial.Serial, n: int, deadline: float) -> Optional[bytes]:
+    buf = bytearray()
+    while len(buf) < n:
+        remaining = n - len(buf)
+        if time.monotonic() >= deadline:
+            return None
+        chunk = ser.read(remaining)
+        if chunk:
+            buf.extend(chunk)
+    return bytes(buf)
+
+
+def _send_receive(ser: serial.Serial, frame: bytes, expected_cid: int,
+                  timeout: float = 5.0) -> Optional[bytes]:
+    """Send frame, read and validate response. Returns full response bytes or None."""
+    deadline = time.monotonic() + timeout
     try:
-        n_tags, offset = struct.unpack_from(">H", data)[0], 2
-        for _ in range(n_tags):
-            if offset >= len(data):
-                break
-            epc_len = data[offset]; offset += 1
-            if offset + epc_len > len(data):
-                break
-            epc  = data[offset : offset + epc_len].hex().upper()
-            offset += epc_len
-            if offset + 2 > len(data):
-                yield epc, 0
-                continue
-            rssi = struct.unpack_from(">h", data, offset)[0]
-            offset += 2
-            yield epc, rssi
-    except Exception as exc:
-        logger.debug("inv parse failed: %s  raw=%s", exc, data.hex())
+        ser.reset_input_buffer()
+        ser.write(frame)
+        ser.flush()
+
+        hdr = _read_exactly(ser, HEADER_LEN, deadline)
+        if not hdr:
+            return None
+
+        txver  = _gu16(hdr, 0)
+        cid    = _gu16(hdr, 2)
+        vendor = _gu32(hdr, 4)
+        length = _gu16(hdr, 8)
+
+        if txver != 0x0001 or vendor != CAEN_VENDOR or cid != expected_cid:
+            logger.debug("Bad response header: txver=0x%04X cid=%d vendor=0x%08X",
+                         txver, cid, vendor)
+            return None
+        if length < HEADER_LEN:
+            return None
+
+        rest_n = length - HEADER_LEN
+        if rest_n == 0:
+            return hdr
+
+        rest = _read_exactly(ser, rest_n, deadline)
+        if rest is None:
+            return None
+        return hdr + rest
+
+    except serial.SerialException as exc:
+        logger.error("Serial error in send_receive: %s", exc)
+        return None
+
+
+# ─── AVP parser ───────────────────────────────────────────────────────────────
+
+def _parse_avps(data: bytes):
+    """Parse AVPs, return list of (type, value_bytes)."""
+    result = []
+    pos = 0
+    while pos + AVP_HEADLEN <= len(data):
+        reserved  = _gu16(data, pos)
+        total_len = _gu16(data, pos + 2)
+        avp_type  = _gu16(data, pos + 4)
+        val_len   = total_len - AVP_HEADLEN
+        if reserved != 0 or val_len < 0 or pos + total_len > len(data):
+            break
+        result.append((avp_type, data[pos + AVP_HEADLEN: pos + total_len]))
+        pos += total_len
+    return result
+
+
+def _extract_tags(avps):
+    """
+    Yield (epc_hex_upper, rssi_int16) from a list of AVPs.
+
+    Non-framed inventory AVP order per tag:
+      SOURCE_NAME, READPOINT_NAME, TIMESTAMP, TAGTYPE, TAGIDLEN, TAGID [, RSSI]
+    followed by RESULT_CODE at the end.
+    """
+    tags = []
+    i = 0
+    while i < len(avps):
+        avp_type, val = avps[i]
+        if avp_type == AVP_TAGID:
+            epc = val.hex().upper()
+            rssi = 0
+            if i + 1 < len(avps) and avps[i + 1][0] == AVP_RSSI:
+                rssi = struct.unpack(">h", avps[i + 1][1])[0]
+                i += 1
+            tags.append((epc, rssi))
+        i += 1
+    return tags
 
 
 # ─── Main reader class ────────────────────────────────────────────────────────
 
 class CaenSerialReader:
     """
-    CAEN R1210IX reader over direct serial connection (no DLL required).
+    CAEN R1210IX reader over serial using the CAEN LightCLib protocol.
 
-    Public API matches CaenReader in main.py:
+    Public API:
       connect() → bool
       disconnect()
       start_inventory(callback)   callback(epc: str, rssi: int, err: int)
@@ -164,21 +202,20 @@ class CaenSerialReader:
       connected  (property)
     """
 
-    BAUD     = 115200
-    TIMEOUT  = 0.25          # serial read timeout in seconds
-    POLL_GAP = 0.05          # pause between inventory polls
+    BAUD      = 115200
+    POLL_GAP  = 0.05          # seconds between inventory polls
+    INV_TIMEOUT = 8.0         # seconds to wait for inventory response
 
     def __init__(self, port: str, power: int = 30, debug: bool = False):
-        self.port    = port
-        self.power   = power
-        self.debug   = debug
+        self.port  = port
+        self.power = power
+        self.debug = debug
         self._ser: Optional[serial.Serial] = None
-        self._rx_buf = bytearray()
-        self._running= False
+        self._seq = _Seq()
+        self._running = False
         self._thread: Optional[threading.Thread] = None
         self._cb: Optional[Callable] = None
-        self._lock   = threading.Lock()
-        self._inv_variant = 0      # which inventory frame variant to use
+        self._lock = threading.Lock()
 
     @property
     def connected(self) -> bool:
@@ -187,151 +224,157 @@ class CaenSerialReader:
     # ── connect / disconnect ─────────────────────────────────────────────────
 
     def connect(self) -> bool:
-        port = self.port
-        # Accept both "COM3" and "\\.\COM3"
-        if not port.startswith("\\\\.\\") and port.upper().startswith("COM"):
-            port = "\\\\.\\" + port
+        port_arg = self.port
+        if not port_arg.startswith("\\\\.\\") and port_arg.upper().startswith("COM"):
+            port_arg = "\\\\.\\" + port_arg
 
         try:
             self._ser = serial.Serial(
-                port        = port,
-                baudrate    = self.BAUD,
-                bytesize    = serial.EIGHTBITS,
-                parity      = serial.PARITY_NONE,
-                stopbits    = serial.STOPBITS_ONE,
-                timeout     = self.TIMEOUT,
-                write_timeout= 2.0,
-                xonxoff     = False,
-                rtscts      = False,
+                port=port_arg,
+                baudrate=self.BAUD,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+                timeout=0.1,
+                write_timeout=2.0,
+                xonxoff=False,
+                rtscts=False,
             )
-            # Many CAEN readers require RTS (and DTR) to be asserted before
-            # they will respond over the CDC virtual COM port.
             self._ser.rts = True
             self._ser.dtr = True
-            time.sleep(0.3)   # let reader see the signal change
+            time.sleep(0.3)
             self._ser.reset_input_buffer()
-            logger.info("Opened %s at %d baud (RTS/DTR asserted)", self.port, self.BAUD)
+            logger.info("Opened %s at %d baud", self.port, self.BAUD)
         except serial.SerialException as exc:
             logger.error("Cannot open %s: %s", self.port, exc)
             return False
 
-        # Ping the reader
-        info = self._transact(CMD_READER_INFO, timeout=2.0)
-        if info is not None:
-            logger.info("Reader info response: %s", info.hex() if info else "(empty)")
-        else:
-            logger.warning(
-                "No response to READER_INFO on %s — "
-                "reader may use a different protocol or baud rate. "
-                "Inventory will still be attempted.",
-                self.port,
-            )
+        # Cancel any pending framed inventory from a previous session
+        try:
+            self._ser.write(bytes([UART_ABORT]))
+            self._ser.flush()
+            time.sleep(0.3)
+            self._ser.reset_input_buffer()
+        except Exception:
+            pass
 
-        # Set RF power
-        ack = self._transact(CMD_SET_POWER, bytes([max(0, min(30, self.power))]), timeout=1.0)
-        if ack is not None:
-            logger.info("RF power set to %d dBm (ack=%s)", self.power, ack.hex() if ack else "OK")
+        # Probe reader
+        frame, cid = make_getrdrinfo(self._seq)
+        if self.debug:
+            logger.debug("TX GetReaderInfo: %s", frame.hex())
+        resp = _send_receive(self._ser, frame, cid, timeout=4.0)
+        if resp is not None:
+            avps = _parse_avps(resp[HEADER_LEN:])
+            for atype, val in avps:
+                if atype == AVP_READERINFO:
+                    try:
+                        info = val.rstrip(b"\x00").decode("ascii")
+                        logger.info("Reader: %s", info)
+                    except Exception:
+                        pass
+            logger.info("Reader connected (CAEN LightCLib protocol)")
+            return True
 
-        return True
+        # Retry GetFirmwareRelease as fallback
+        frame2, cid2 = make_getfwrelease(self._seq)
+        resp2 = _send_receive(self._ser, frame2, cid2, timeout=4.0)
+        if resp2 is not None:
+            logger.info("Reader connected (firmware query OK)")
+            return True
+
+        logger.warning(
+            "No response to GetReaderInfo on %s. "
+            "Reader may be connected but not responding — "
+            "inventory will still be attempted.",
+            self.port
+        )
+        return True   # Keep open; inventory may still work
 
     def disconnect(self):
         self._running = False
         if self._ser and self._ser.is_open:
             try:
+                self._ser.write(bytes([UART_ABORT]))
+                self._ser.flush()
+            except Exception:
+                pass
+            try:
                 self._ser.close()
             except Exception:
                 pass
         self._ser = None
+        logger.info("Disconnected from %s", self.port)
 
     # ── inventory control ────────────────────────────────────────────────────
 
     def start_inventory(self, callback: Callable):
-        self._cb      = callback
+        self._cb = callback
         self._running = True
-        self._thread  = threading.Thread(
-            target=self._poll_loop, daemon=True, name="caen-serial"
+        self._thread = threading.Thread(
+            target=self._poll_loop, daemon=True, name="caen-light"
         )
         self._thread.start()
+        logger.info("Inventory started on %s", self.port)
 
     def stop_inventory(self):
         self._running = False
+        if self._ser and self._ser.is_open:
+            try:
+                self._ser.write(bytes([UART_ABORT]))
+                self._ser.flush()
+            except Exception:
+                pass
+        logger.info("Inventory stopped on %s", self.port)
 
-    # ── internal helpers ─────────────────────────────────────────────────────
-
-    def _write(self, frame: bytes):
-        if self.debug:
-            logger.debug("TX [%d]: %s", len(frame), frame.hex())
-        self._ser.write(frame)
-        self._ser.flush()
-
-    def _read_into_buf(self, window: float):
-        """Read available bytes into _rx_buf for up to `window` seconds."""
-        deadline = time.monotonic() + window
-        while time.monotonic() < deadline:
-            chunk = self._ser.read(self._ser.in_waiting or 256)
-            if chunk:
-                if self.debug:
-                    logger.debug("RX [%d]: %s", len(chunk), chunk.hex())
-                self._rx_buf.extend(chunk)
-
-    def _transact(self, cmd: int, data: bytes = b"", timeout: float = 1.0) -> Optional[bytes]:
-        """Send command and return the first matching response payload, or None."""
-        frame    = build_frame(cmd, data)
-        exp_resp = cmd | 0x80
-        try:
-            with self._lock:
-                self._write(frame)
-                deadline = time.monotonic() + timeout
-                local_buf = bytearray()
-                while time.monotonic() < deadline:
-                    chunk = self._ser.read(self._ser.in_waiting or 128)
-                    if chunk:
-                        local_buf.extend(chunk)
-                        for r_cmd, r_data in list(_iter_frames(local_buf)):
-                            if r_cmd == exp_resp:
-                                return r_data
-                            if r_cmd == RESP_ERROR:
-                                logger.warning("Reader error response: %s", r_data.hex())
-        except serial.SerialException as exc:
-            logger.error("Serial error in transact: %s", exc)
-        return None
+    # ── poll loop ────────────────────────────────────────────────────────────
 
     def _poll_loop(self):
-        """Background thread: continuously poll inventory and fire callbacks."""
-        variants      = list(_inv_frames())
-        variant_idx   = 0
-        zero_streak   = 0              # consecutive polls with zero tags
-        switch_after  = 10             # switch variant after this many empty polls
+        consecutive_errors = 0
 
         while self._running:
-            frame = variants[variant_idx % len(variants)]
             try:
                 with self._lock:
-                    self._write(frame)
-                    self._read_into_buf(0.4)
+                    frame, cid = make_inventory(self._seq)
+                    if self.debug:
+                        logger.debug("TX Inventory: %s", frame.hex())
 
-                tags_this_cycle = 0
-                for r_cmd, r_data in list(_iter_frames(self._rx_buf)):
-                    if r_cmd == RESP_INVENTORY:
-                        for epc, rssi in _parse_inv_data(r_data):
-                            tags_this_cycle += 1
-                            if self._cb:
-                                self._cb(epc, rssi, 0)
-                    elif r_cmd == RESP_ERROR:
-                        logger.debug("Reader error frame: %s", r_data.hex())
+                    resp = _send_receive(self._ser, frame, cid, self.INV_TIMEOUT)
 
-                if tags_this_cycle == 0:
-                    zero_streak += 1
-                    if zero_streak >= switch_after:
-                        # Protocol variant isn't producing tags — try the next one
-                        variant_idx  = (variant_idx + 1) % len(variants)
-                        zero_streak  = 0
-                        logger.debug("Switching to inventory variant %d", variant_idx)
-                else:
-                    zero_streak = 0
+                if resp is None:
+                    consecutive_errors += 1
+                    if consecutive_errors >= 5:
+                        logger.error(
+                            "5 consecutive inventory timeouts on %s — stopping",
+                            self.port
+                        )
+                        break
+                    if self.debug:
+                        logger.debug("Inventory timeout #%d", consecutive_errors)
+                    time.sleep(0.2)
+                    continue
+
+                consecutive_errors = 0
+                if self.debug:
+                    logger.debug("RX Inventory [%dB]: %s", len(resp), resp.hex())
+
+                avps = _parse_avps(resp[HEADER_LEN:])
+                tags = _extract_tags(avps)
+
+                for epc, rssi in tags:
+                    if self._cb:
+                        try:
+                            self._cb(epc, rssi, 0)
+                        except Exception as exc:
+                            logger.error("Callback error: %s", exc)
+
+                if tags:
+                    logger.debug("Inventory: %d tag(s)", len(tags))
 
             except serial.SerialException as exc:
                 logger.error("Serial error in poll loop: %s", exc)
                 break
 
             time.sleep(self.POLL_GAP)
+
+        self._running = False
+        logger.info("Poll loop exited for %s", self.port)
