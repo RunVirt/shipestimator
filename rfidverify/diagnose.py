@@ -171,10 +171,15 @@ for dll_path in candidates:
     found_wanted = [e for e in exports if e in WANTED]
     if found_wanted:
         print(f"    CAEN functions: {', '.join(found_wanted)}")
+
+    # Show every CAENRFID-prefixed export (case-insensitive)
+    caen_exports = sorted(e for e in exports if e.upper().startswith("CAENRFID"))
+    if caen_exports:
+        print(f"    All CAENRFID exports ({len(caen_exports)}):")
+        for name in caen_exports:
+            print(f"      {name}")
     elif exports:
-        # Show first 8 exports as a hint
-        sample = exports[:8]
-        print(f"    First 8 exports: {', '.join(sample)}")
+        print(f"    First 12 exports: {', '.join(exports[:12])}")
     else:
         print("    (no named exports found — may use ordinals)")
 
