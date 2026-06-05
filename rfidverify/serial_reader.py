@@ -204,8 +204,13 @@ class CaenSerialReader:
                 xonxoff     = False,
                 rtscts      = False,
             )
+            # Many CAEN readers require RTS (and DTR) to be asserted before
+            # they will respond over the CDC virtual COM port.
+            self._ser.rts = True
+            self._ser.dtr = True
+            time.sleep(0.3)   # let reader see the signal change
             self._ser.reset_input_buffer()
-            logger.info("Opened %s at %d baud", self.port, self.BAUD)
+            logger.info("Opened %s at %d baud (RTS/DTR asserted)", self.port, self.BAUD)
         except serial.SerialException as exc:
             logger.error("Cannot open %s: %s", self.port, exc)
             return False
