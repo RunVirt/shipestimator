@@ -7,5 +7,6 @@
   "encodingDb": "EliteFeats_115000__Sheet1.csv",
   "rssiThreshold": -70,
   "webPort": 8765,
+  "dllPath": "",
   "debug": false
 }

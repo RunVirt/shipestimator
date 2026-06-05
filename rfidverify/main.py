@@ -2,30 +2,25 @@
 """
 RFID Verification Tool — EliteFeats + CAEN R1210IX Edition
 
-Reads tags continuously from a CAEN R1210IX Smart Tray Reader over
-USB/COM port, looks up each EPC in the EliteFeats encoding CSV, and
-flags any bib with an RSSI below the configured threshold.
-
-CAEN serial protocol (easyReader SDK):
-  Frame: STX(0x02) + LEN(2 LE) + CMD(1) + DATA(N) + CRC16(2 LE) + ETX(0x03)
-  Inventory response frames arrive continuously once inventory is started.
-  Each tag frame contains: EPC length, EPC bytes, RSSI (signed, 1/10 dBm).
+Reads tags from a CAEN R1210IX Smart Tray Reader via CAENRFIDLib.dll
+(SDK 5.0.0, 64-bit), looks up each EPC in the EliteFeats encoding CSV,
+and flags bibs whose RSSI never exceeds the configured threshold.
 """
 
 import csv
+import ctypes
+import glob
 import json
 import logging
 import os
-import struct
 import sys
 import threading
 import time
 import webbrowser
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set
 
-import serial
 from flask import Flask
 from flask_socketio import SocketIO, emit
 
@@ -34,16 +29,18 @@ from flask_socketio import SocketIO, emit
 SETTINGS_FILE = Path(__file__).parent / "settings.json"
 
 DEFAULT_SETTINGS = {
-    "comPort":      "COM3",
-    "baudRate":     115200,
-    "readPower":    30,
-    "dataDir":      "data",
-    "filePrefix":   "rfid_reads",
-    "encodingDb":   "EliteFeats_115000__Sheet1.csv",
+    "comPort":       "COM3",
+    "baudRate":      115200,
+    "readPower":     30,
+    "dataDir":       "data",
+    "filePrefix":    "rfid_reads",
+    "encodingDb":    "EliteFeats_115000__Sheet1.csv",
     "rssiThreshold": -70,
-    "webPort":      8765,
-    "debug":        False,
+    "webPort":       8765,
+    "dllPath":       "",
+    "debug":         False,
 }
+
 
 def load_settings() -> dict:
     if SETTINGS_FILE.exists():
@@ -51,56 +48,52 @@ def load_settings() -> dict:
             return {**DEFAULT_SETTINGS, **json.load(f)}
     return DEFAULT_SETTINGS.copy()
 
+
 def save_settings(s: dict):
     with open(SETTINGS_FILE, "w") as f:
         json.dump(s, f, indent=2)
 
-# ─── RFID Error descriptions ───────────────────────────────────────────────────
 
-RFID_ERRORS: Dict[int, str] = {
-    0x00: "OK",
-    0x01: "NO TAG FOUND",
-    0x02: "READ ERROR",
-    0x03: "CRC ERROR",
-    0x04: "PROTOCOL ERROR",
-    0xFF: "UNKNOWN ERROR",
-}
+# ─── CAEN SDK ctypes structures ────────────────────────────────────────────────
 
-# ─── CAEN easyReader protocol constants ───────────────────────────────────────
+class _TimeVal(ctypes.Structure):
+    # struct timeval from <winsock2.h>; Windows long is always 4 bytes
+    _fields_ = [
+        ("tv_sec",  ctypes.c_int32),
+        ("tv_usec", ctypes.c_int32),
+    ]
 
-STX = 0x02
-ETX = 0x03
 
-# Host → Reader commands
-CMD_OPEN_READER    = 0x01   # Open/initialise reader
-CMD_CLOSE_READER   = 0x02   # Close reader
-CMD_SET_PROTOCOL   = 0x03   # Set tag protocol (0x00 = GEN2/ISO18000-6C)
-CMD_SET_POWER      = 0x04   # Set RF power (uint16, dBm * 100)
-CMD_START_INV      = 0x05   # Start continuous inventory
-CMD_STOP_INV       = 0x06   # Stop inventory
+class CAENRFIDTag(ctypes.Structure):
+    """
+    CAENRFIDTag from CAENRFIDTypes.h SDK 5.0.0, MSVC x64 layout.
+    sizeof == 224 bytes on Windows x64.
+    ctypes inserts padding automatically:
+      +3 bytes before TimeStamp (alignment 4)
+      +2 bytes before phaseBegin (alignment 4)
+      +2 bytes before subCmdResultData (alignment 8)
+    """
+    _fields_ = [
+        ("ID",                    ctypes.c_ubyte * 64),  # EPC bytes
+        ("Length",                ctypes.c_int16),        # EPC byte count
+        ("LogicalSource",         ctypes.c_char  * 30),
+        ("ReadPoint",             ctypes.c_char  * 5),
+        ("TimeStamp",             _TimeVal),              # +3 pad before this
+        ("Type",                  ctypes.c_int32),        # CAENRFIDProtocol
+        ("RSSI",                  ctypes.c_int16),        # signed dBm
+        ("TID",                   ctypes.c_ubyte * 64),
+        ("TIDLen",                ctypes.c_int16),
+        ("XPC",                   ctypes.c_ubyte * 4),
+        ("PC",                    ctypes.c_ubyte * 2),
+        ("phaseBegin",            ctypes.c_float),        # +2 pad before this
+        ("phaseEnd",              ctypes.c_float),
+        ("frequency",             ctypes.c_int32),        # Windows long = 4 bytes
+        ("subCmdCode",            ctypes.c_int32),
+        ("subCmdResultCode",      ctypes.c_int32),
+        ("subCmdResultDataCount", ctypes.c_int16),
+        ("subCmdResultData",      ctypes.c_void_p),       # +2 pad before this
+    ]
 
-# Reader → Host response commands
-RESP_TAG           = 0x80   # Tag report: EPC + RSSI
-RESP_ACK           = 0x81   # Command acknowledged
-RESP_ERR           = 0x82   # Error response
-RESP_INV_END       = 0x83   # Inventory session ended
-
-MIN_FRAME = 7   # STX(1) + LEN(2) + CMD(1) + CRC(2) + ETX(1)
-
-def _crc16(data: bytes) -> int:
-    crc = 0xFFFF
-    for b in data:
-        crc ^= b
-        for _ in range(8):
-            crc = (crc >> 1) ^ 0xA001 if crc & 1 else crc >> 1
-    return crc
-
-def _build_frame(cmd: int, data: bytes = b"") -> bytes:
-    payload = bytes([cmd]) + data
-    length  = struct.pack("<H", len(payload))
-    body    = length + payload
-    crc     = struct.pack("<H", _crc16(body))
-    return bytes([STX]) + body + crc + bytes([ETX])
 
 # ─── Encoding Database ────────────────────────────────────────────────────────
 
@@ -128,6 +121,7 @@ class EncodingDatabase:
     def __len__(self):
         return len(self._db) // 2
 
+
 # ─── Failed Bib Tracker ───────────────────────────────────────────────────────
 
 class FailedBibTracker:
@@ -150,214 +144,199 @@ class FailedBibTracker:
         self._success.clear()
         self._failed.clear()
 
+
 # ─── CAEN R1210IX Reader ──────────────────────────────────────────────────────
 
 class CaenReader:
     """
-    CAEN R1210IX Smart Tray Reader via USB/COM port.
+    CAEN R1210IX Smart Tray Reader via CAENRFIDLib.dll (SDK 5.0.0, 64-bit).
 
-    Uses CAEN's easyReader binary protocol (STX-framed packets).
-    Runs continuous inventory in a background thread and calls
-    tag_callback(epc: str, rssi_dbm: int, err: int) for every read.
+    Polls CAENRFIDLib_InventoryTag in a background thread and calls
+    tag_callback(epc: str, rssi_dbm: int, err: int) for every tag read.
 
-    If debug=True, all raw bytes sent and received are printed so the
-    protocol can be verified against the actual reader firmware.
+    Set 'dllPath' in settings.json to the 64-bit CAENRFIDLib.dll if
+    auto-detection fails (see connect() log output for details).
     """
 
-    def __init__(self, port: str, baud: int, power: int, debug: bool = False):
-        self.port  = port
-        self.baud  = baud
-        self.power = power
-        self.debug = debug
-        self._ser:  Optional[serial.Serial] = None
-        self._buf   = b""
+    _EOF = -13  # CAENRFID_EOF — no tags in this scan cycle
+
+    def __init__(self, port: str, power: int, dll_path: str = "", debug: bool = False):
+        self.port     = port
+        self.power    = power
+        self.dll_path = dll_path
+        self.debug    = debug
+        self._lib: Optional[ctypes.CDLL] = None
+        self._handle  = ctypes.c_void_p(0)
         self._running = False
         self._callback: Optional[Callable] = None
 
     @property
     def connected(self) -> bool:
-        return self._ser is not None and self._ser.is_open
+        return self._lib is not None and bool(self._handle.value)
 
     def connect(self) -> bool:
-        try:
-            self._ser = serial.Serial(
-                port=self.port,
-                baudrate=self.baud,
-                bytesize=serial.EIGHTBITS,
-                parity=serial.PARITY_NONE,
-                stopbits=serial.STOPBITS_ONE,
-                timeout=0.1,
-            )
-            self._buf = b""
-            logging.info("Opened %s at %d baud", self.port, self.baud)
-
-            # Initialise reader
-            self._send(CMD_OPEN_READER)
-            time.sleep(0.2)
-            self._drain()
-
-            # Set GEN2 protocol
-            self._send(CMD_SET_PROTOCOL, bytes([0x00]))
-            time.sleep(0.1)
-            self._drain()
-
-            # Set RF power (dBm * 100, e.g. 3000 = 30.00 dBm)
-            power_raw = min(max(self.power, 0), 30) * 100
-            self._send(CMD_SET_POWER, struct.pack("<H", power_raw))
-            time.sleep(0.1)
-            self._drain()
-
-            return True
-        except serial.SerialException as e:
-            logging.error("CAEN connect failed: %s", e)
+        if not hasattr(ctypes, "WinDLL"):
+            logging.error("CAENRFIDLib.dll requires Windows")
             return False
+
+        dll = self._find_dll()
+        if not dll:
+            logging.error(
+                "CAENRFIDLib.dll not found. Add \"dllPath\" to settings.json "
+                "with the full path to the 64-bit CAENRFIDLib.dll, e.g.: "
+                r'"dllPath": "C:\\path\\to\\64bit\\CAENRFIDLib.dll"'
+            )
+            return False
+
+        logging.info("Loading DLL: %s", dll)
+        try:
+            self._lib = ctypes.WinDLL(dll)
+        except OSError as e:
+            logging.error("Failed to load DLL: %s", e)
+            return False
+
+        try:
+            self._lib.CAENRFIDLib_Connect.restype  = ctypes.c_int
+            self._lib.CAENRFIDLib_Connect.argtypes = [
+                ctypes.c_char_p,
+                ctypes.POINTER(ctypes.c_void_p),
+            ]
+        except AttributeError:
+            logging.error("CAENRFIDLib_Connect not found — wrong DLL version or 32-bit DLL?")
+            return False
+
+        ret = self._lib.CAENRFIDLib_Connect(
+            self.port.encode(), ctypes.byref(self._handle)
+        )
+        if ret != 0:
+            logging.error("CAENRFIDLib_Connect('%s') returned %d", self.port, ret)
+            return False
+
+        logging.info("Connected to reader on %s", self.port)
+        self._try_set_power()
+        return True
 
     def disconnect(self):
         self._running = False
-        if self._ser and self._ser.is_open:
+        if self._lib and self._handle.value:
             try:
-                self._send(CMD_STOP_INV)
-                time.sleep(0.05)
-                self._send(CMD_CLOSE_READER)
-                time.sleep(0.05)
-                self._ser.close()
+                self._lib.CAENRFIDLib_Disconnect.restype  = ctypes.c_int
+                self._lib.CAENRFIDLib_Disconnect.argtypes = [ctypes.c_void_p]
+                self._lib.CAENRFIDLib_Disconnect(self._handle)
             except Exception:
                 pass
-        self._ser = None
+        self._handle = ctypes.c_void_p(0)
+        self._lib    = None
 
     def start_inventory(self, callback: Callable):
         self._callback = callback
         self._running  = True
-        self._send(CMD_START_INV)
-        t = threading.Thread(target=self._read_loop, daemon=True, name="caen-rx")
+        t = threading.Thread(target=self._poll_loop, daemon=True, name="caen-poll")
         t.start()
 
     def stop_inventory(self):
         self._running = False
-        self._send(CMD_STOP_INV)
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
-    def _send(self, cmd: int, data: bytes = b""):
-        if not (self._ser and self._ser.is_open):
-            return
-        frame = _build_frame(cmd, data)
-        if self.debug:
-            print(f"TX: {frame.hex()}  ({frame!r})", flush=True)
-        try:
-            self._ser.write(frame)
-        except serial.SerialException as e:
-            logging.error("Serial write error: %s", e)
+    def _find_dll(self) -> str:
+        if self.dll_path and os.path.exists(self.dll_path):
+            return self.dll_path
 
-    def _drain(self):
-        """Read and discard any pending bytes (e.g. ACKs after setup cmds)."""
-        if not (self._ser and self._ser.is_open):
-            return
-        time.sleep(0.05)
-        pending = self._ser.in_waiting
-        if pending:
-            data = self._ser.read(pending)
-            if self.debug:
-                print(f"DRAIN ({len(data)} bytes): {data.hex()}  {data!r}", flush=True)
+        patterns = [
+            r"C:\Program Files\CAEN\**\CAENRFIDLib.dll",
+            r"C:\Program Files (x86)\CAEN\**\CAENRFIDLib.dll",
+            r"C:\CAEN\**\CAENRFIDLib.dll",
+            r"C:\Windows\System32\CAENRFIDLib.dll",
+            r"C:\Windows\SysWOW64\CAENRFIDLib.dll",
+        ]
 
-    def _read_loop(self):
-        while self._running and self._ser and self._ser.is_open:
+        # Also search the current user's Desktop and OneDrive Desktop
+        user = os.environ.get("USERNAME") or os.environ.get("USER", "")
+        if user:
+            patterns += [
+                rf"C:\Users\{user}\Desktop\**\CAENRFIDLib.dll",
+                rf"C:\Users\{user}\OneDrive\Desktop\**\CAENRFIDLib.dll",
+                rf"C:\Users\{user}\OneDrive - *\Desktop\**\CAENRFIDLib.dll",
+            ]
+
+        for pat in patterns:
             try:
-                chunk = self._ser.read(256)
-            except serial.SerialException as e:
-                logging.error("Serial read error: %s", e)
-                break
-            if chunk:
-                if self.debug:
-                    print(f"RAW RX ({len(chunk)} bytes): {chunk.hex()}  {chunk!r}", flush=True)
-                self._buf += chunk
-                self._process_buf()
-
-    def _process_buf(self):
-        while len(self._buf) >= MIN_FRAME:
-            # Find next STX
-            stx = self._buf.find(STX)
-            if stx < 0:
-                self._buf = b""
-                return
-            if stx > 0:
-                self._buf = self._buf[stx:]
-
-            if len(self._buf) < MIN_FRAME:
-                return
-
-            # Parse length field
-            length = struct.unpack_from("<H", self._buf, 1)[0]
-            frame_total = 1 + 2 + length + 2 + 1  # STX+LEN+PAYLOAD+CRC+ETX
-
-            if len(self._buf) < frame_total:
-                return  # Wait for rest of frame
-
-            frame = self._buf[:frame_total]
-            self._buf = self._buf[frame_total:]
-
-            if frame[-1] != ETX:
-                if self.debug:
-                    print(f"Bad ETX, skipping frame: {frame.hex()}", flush=True)
+                hits = glob.glob(pat, recursive=True)
+            except Exception:
                 continue
+            if hits:
+                logging.info("Auto-detected DLL: %s", hits[0])
+                return hits[0]
 
-            # Verify CRC
-            body     = frame[1:-3]   # LEN + PAYLOAD
-            received = struct.unpack_from("<H", frame, frame_total - 3)[0]
-            expected = _crc16(body)
-            if received != expected:
-                if self.debug:
-                    print(f"CRC mismatch: got {received:04X} expected {expected:04X}", flush=True)
-                continue
+        # Check directories near this script (if DLL was copied locally)
+        script_dir = Path(__file__).parent
+        for search_dir in (script_dir, script_dir.parent):
+            for f in search_dir.rglob("CAENRFIDLib.dll"):
+                return str(f)
 
-            cmd     = frame[3]
-            payload = frame[4:4 + length - 1]
+        return ""
 
-            if self.debug:
-                print(f"FRAME cmd=0x{cmd:02X} payload({len(payload)}B)={payload.hex()}", flush=True)
+    def _try_set_power(self):
+        try:
+            fn = self._lib.CAENRFIDLib_SetSourcePower
+            fn.restype  = ctypes.c_int
+            fn.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+            fn(self._handle, b"Source_0", self.power)
+            logging.info("RF power set to %d dBm", self.power)
+        except AttributeError:
+            pass  # Not critical; reader retains last-used power setting
 
-            self._dispatch(cmd, payload)
-
-    def _dispatch(self, cmd: int, payload: bytes):
-        if cmd == RESP_TAG:
-            self._handle_tag(payload)
-        elif cmd == RESP_ERR:
-            err = payload[0] if payload else 0xFF
-            logging.warning("Reader error: %s", RFID_ERRORS.get(err, f"0x{err:02X}"))
-        elif cmd == RESP_ACK:
-            logging.debug("Reader ACK")
-        elif cmd == RESP_INV_END:
-            logging.info("Inventory session ended by reader")
-        else:
-            if self.debug:
-                print(f"Unknown response cmd=0x{cmd:02X}: {payload.hex()}", flush=True)
-
-    def _handle_tag(self, payload: bytes):
-        """
-        Tag payload: [epc_len:1][epc_bytes:epc_len][rssi:2 LE signed, 1/10 dBm]
-        """
-        if len(payload) < 3:
-            if self.debug:
-                print(f"Short tag payload: {payload.hex()}", flush=True)
+    def _poll_loop(self):
+        try:
+            self._lib.CAENRFIDLib_InventoryTag.restype  = ctypes.c_int
+            self._lib.CAENRFIDLib_InventoryTag.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.POINTER(ctypes.c_uint16),
+            ]
+        except AttributeError:
+            logging.error("CAENRFIDLib_InventoryTag not found in DLL")
+            self._running = False
             return
 
-        epc_len = payload[0]
-        if len(payload) < 1 + epc_len + 2:
-            if self.debug:
-                print(f"Incomplete tag payload: {payload.hex()}", flush=True)
+        while self._running:
+            tags_ptr = ctypes.c_void_p(0)
+            count    = ctypes.c_uint16(0)
+
+            ret = self._lib.CAENRFIDLib_InventoryTag(
+                self._handle,
+                ctypes.byref(tags_ptr),
+                ctypes.byref(count),
+            )
+
+            if ret == 0 and count.value > 0 and tags_ptr.value:
+                self._process_tags(tags_ptr, count.value)
+            elif ret not in (0, self._EOF):
+                if self.debug:
+                    print(f"InventoryTag returned {ret}", flush=True)
+                time.sleep(0.1)
+
+            time.sleep(0.05)
+
+    def _process_tags(self, tags_ptr: ctypes.c_void_p, count: int):
+        array_type = CAENRFIDTag * count
+        try:
+            tags = ctypes.cast(tags_ptr, ctypes.POINTER(array_type)).contents
+        except Exception as e:
+            logging.error("Failed to cast tag array: %s", e)
             return
 
-        epc_bytes = payload[1:1 + epc_len]
-        epc = epc_bytes.hex().upper()
+        for tag in tags:
+            if tag.Length <= 0 or tag.Length > 64:
+                continue
+            epc  = bytes(tag.ID[:tag.Length]).hex().upper()
+            rssi = int(tag.RSSI)
+            if self.debug:
+                print(f"TAG  EPC={epc}  RSSI={rssi} dBm", flush=True)
+            if self._callback:
+                self._callback(epc, rssi, 0)
 
-        rssi_raw = struct.unpack_from("<h", payload, 1 + epc_len)[0]
-        rssi_dbm = rssi_raw // 10   # convert 1/10 dBm to dBm
-
-        if self.debug:
-            print(f"TAG  EPC={epc}  RSSI={rssi_dbm} dBm", flush=True)
-
-        if self._callback:
-            self._callback(epc, rssi_dbm, 0)
 
 # ─── Verification Runner ──────────────────────────────────────────────────────
 
@@ -367,10 +346,10 @@ class VerificationRunner:
         self._db       = db
         self._sio      = socketio
         self._reader   = CaenReader(
-            port  = settings["comPort"],
-            baud  = settings.get("baudRate", 115200),
-            power = settings.get("readPower", 30),
-            debug = settings.get("debug", False),
+            port     = settings["comPort"],
+            power    = settings.get("readPower", 30),
+            dll_path = settings.get("dllPath", ""),
+            debug    = settings.get("debug", False),
         )
         self._tracker  = FailedBibTracker()
         self._running  = False
@@ -419,7 +398,12 @@ class VerificationRunner:
         if not self._reader.connect():
             self._broadcast("status", {
                 "type":  "error",
-                "error": f"Failed to open {self._settings['comPort']} — check the port and that the reader is plugged in",
+                "error": (
+                    f"Failed to connect on {self._settings['comPort']}. "
+                    "Make sure: (1) CAEN software is fully closed, "
+                    "(2) the reader is plugged in, "
+                    "(3) dllPath in settings points to the 64-bit CAENRFIDLib.dll."
+                ),
             })
             self._running = False
             return
@@ -427,7 +411,6 @@ class VerificationRunner:
         self._broadcast("status", {"type": "status", "status": "running"})
         self._reader.start_inventory(self._on_tag)
 
-        # Keep thread alive until stopped
         while self._running:
             time.sleep(0.2)
 
@@ -435,7 +418,6 @@ class VerificationRunner:
         self._finish()
 
     def _on_tag(self, epc: str, rssi: int, err: int):
-        """Called from the CAEN reader thread for every tag read."""
         with self._lock:
             if not self._running or self._paused:
                 return
@@ -445,14 +427,14 @@ class VerificationRunner:
         is_ok = err == 0 and bib is not None and rssi >= self._settings.get("rssiThreshold", -70)
 
         result = {
-            "type":          "result",
-            "tagData":       epc,
-            "bib":           bib or "UNKNOWN",
-            "readAttempt":   self.total_tested,
-            "errorCode":     err,
-            "errorDesc":     RFID_ERRORS.get(err, f"CODE 0x{err:02X}"),
-            "rssi":          rssi,
-            "success":       is_ok,
+            "type":            "result",
+            "tagData":         epc,
+            "bib":             bib or "UNKNOWN",
+            "readAttempt":     self.total_tested,
+            "errorCode":       err,
+            "errorDesc":       "OK" if err == 0 else f"ERR {err}",
+            "rssi":            rssi,
+            "success":         is_ok,
             "totalTagsTested": self.total_tested,
         }
 
@@ -470,12 +452,12 @@ class VerificationRunner:
     def _finish(self):
         bibs = self._tracker.bibs_needing_reprint()
         summary = {
-            "type":              "summary",
-            "totalTagsTested":   self.total_tested,
-            "successfulReads":   self.successful_reads,
-            "failedReads":       self.failed_reads,
+            "type":               "summary",
+            "totalTagsTested":    self.total_tested,
+            "successfulReads":    self.successful_reads,
+            "failedReads":        self.failed_reads,
             "bibsNeedingReprint": bibs,
-            "success":           len(bibs) == 0,
+            "success":            len(bibs) == 0,
         }
 
         if bibs:
@@ -485,8 +467,8 @@ class VerificationRunner:
             logging.info("All bib numbers verified successfully!")
 
         self._write_csv(summary)
-        self._broadcast("summary",  summary)
-        self._broadcast("status",   {"type": "status", "status": "stopped"})
+        self._broadcast("summary", summary)
+        self._broadcast("status",  {"type": "status", "status": "stopped"})
         self._running = False
 
     def _write_csv(self, summary: dict):
@@ -513,12 +495,12 @@ class VerificationRunner:
     def _broadcast(self, event: str, data: dict):
         self._sio.emit(event, data)
 
+
 # ─── Import / Analyze existing CSV ───────────────────────────────────────────
 
 def import_csv_and_analyze(csv_path: str, db: EncodingDatabase,
                            rssi_threshold: int) -> dict:
     """Analyze a previously saved rfid_reads CSV against the encoding DB."""
-    from collections import defaultdict
     tracker = FailedBibTracker()
     total = ok = 0
 
@@ -542,17 +524,18 @@ def import_csv_and_analyze(csv_path: str, db: EncodingDatabase,
 
     bibs = tracker.bibs_needing_reprint()
     return {
-        "type":              "summary",
-        "totalTagsTested":   total,
-        "successfulReads":   ok,
-        "failedReads":       total - ok,
+        "type":               "summary",
+        "totalTagsTested":    total,
+        "successfulReads":    ok,
+        "failedReads":        total - ok,
         "bibsNeedingReprint": bibs,
-        "success":           len(bibs) == 0,
+        "success":            len(bibs) == 0,
     }
+
 
 # ─── Flask / SocketIO ─────────────────────────────────────────────────────────
 
-app     = Flask(__name__, static_folder="static")
+app      = Flask(__name__, static_folder="static")
 app.config["SECRET_KEY"] = "rfidverify-elitefeats-caen"
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="gevent")
 
@@ -560,9 +543,11 @@ _settings: dict = {}
 _db:       Optional[EncodingDatabase] = None
 _runner:   Optional[VerificationRunner] = None
 
+
 @app.route("/")
 def index():
     return app.send_static_file("index.html")
+
 
 @socketio.on("connect")
 def on_connect():
@@ -574,6 +559,7 @@ def on_connect():
     status = "running" if (_runner and _runner.is_running()) else "stopped"
     emit("status", {"type": "status", "status": status})
 
+
 @socketio.on("start")
 def on_start(data=None):
     global _runner
@@ -582,10 +568,12 @@ def on_start(data=None):
     _runner = VerificationRunner(_settings, _db, socketio)
     _runner.start()
 
+
 @socketio.on("stop")
 def on_stop(data=None):
     if _runner:
         _runner.stop()
+
 
 @socketio.on("pause")
 def on_pause(data=None):
@@ -593,17 +581,19 @@ def on_pause(data=None):
         _runner.pause()
     emit("status", {"type": "status", "status": "paused"})
 
+
 @socketio.on("resume")
 def on_resume(data=None):
     if _runner:
         _runner.resume()
     emit("status", {"type": "status", "status": "running"})
 
+
 @socketio.on("settings")
 def on_settings(data: dict):
     global _settings, _db
     allowed = {"comPort", "baudRate", "readPower", "dataDir", "filePrefix",
-               "encodingDb", "rssiThreshold", "webPort"}
+               "encodingDb", "rssiThreshold", "webPort", "dllPath"}
     for k, v in data.items():
         if k in allowed:
             _settings[k] = v
@@ -619,6 +609,7 @@ def on_settings(data: dict):
         "dbTagCount": len(_db),
     })
 
+
 @socketio.on("import")
 def on_import(data: dict):
     path = data.get("path", "")
@@ -631,6 +622,7 @@ def on_import(data: dict):
         ))
     except Exception as e:
         emit("status", {"type": "error", "error": str(e)})
+
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
@@ -663,6 +655,7 @@ def main():
 
     threading.Thread(target=open_browser, daemon=True).start()
     socketio.run(app, host="0.0.0.0", port=port, debug=False)
+
 
 if __name__ == "__main__":
     main()

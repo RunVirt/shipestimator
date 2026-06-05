@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """
-CAEN R1210IX - SDK diagnostic.
-Searches for CAENrfid.dll (installed with CAEN software) and uses it
-to connect to the reader. Paste the full output so we can confirm
-which DLL was found and whether the connection works.
+CAEN R1210IX — SDK 5.0.0 diagnostic.
+
+Finds CAENRFIDLib.dll (64-bit), connects to the reader, runs one
+inventory cycle, and prints any tags found.  Paste the full output
+so we can confirm which DLL was used and whether reads work.
+
+Usage:
+  python diagnose.py
+  python diagnose.py "C:\\full\\path\\to\\64bit\\CAENRFIDLib.dll"
 """
 
 import ctypes
 import ctypes.util
 import glob
-import json
 import os
 import sys
 import time
@@ -17,117 +21,182 @@ from pathlib import Path
 
 import serial.tools.list_ports
 
-# ── List COM ports ────────────────────────────────────────────────────────────
-print("=" * 60)
+SEP = "=" * 60
+
+# ── COM ports ─────────────────────────────────────────────────────────────────
+print(SEP)
 print("Available COM ports:")
-import serial
 for p in serial.tools.list_ports.comports():
     print(f"  {p.device:10s}  {p.description}")
-print("=" * 60)
+print(SEP)
 
-# ── Search for CAENrfid.dll ───────────────────────────────────────────────────
-print("\nSearching for CAENrfid.dll...")
+# ── Find CAENRFIDLib.dll ──────────────────────────────────────────────────────
+print("\nSearching for CAENRFIDLib.dll (64-bit)...")
 
-search_paths = [
-    r"C:\Program Files\CAEN\**\CAENrfid.dll",
-    r"C:\Program Files (x86)\CAEN\**\CAENrfid.dll",
-    r"C:\Program Files\CAEN\**\CAENrfid*.dll",
-    r"C:\Program Files (x86)\CAEN\**\CAENrfid*.dll",
-    r"C:\CAEN\**\CAENrfid.dll",
-    r"C:\Windows\System32\CAENrfid.dll",
-    r"C:\Windows\SysWOW64\CAENrfid.dll",
+dll_path = sys.argv[1] if len(sys.argv) > 1 else ""
+
+if not dll_path:
+    user = os.environ.get("USERNAME") or os.environ.get("USER", "")
+    patterns = [
+        r"C:\Program Files\CAEN\**\CAENRFIDLib.dll",
+        r"C:\Program Files (x86)\CAEN\**\CAENRFIDLib.dll",
+        r"C:\CAEN\**\CAENRFIDLib.dll",
+        r"C:\Windows\System32\CAENRFIDLib.dll",
+        r"C:\Windows\SysWOW64\CAENRFIDLib.dll",
+    ]
+    if user:
+        patterns += [
+            rf"C:\Users\{user}\Desktop\**\CAENRFIDLib.dll",
+            rf"C:\Users\{user}\OneDrive\Desktop\**\CAENRFIDLib.dll",
+            rf"C:\Users\{user}\OneDrive - *\Desktop\**\CAENRFIDLib.dll",
+        ]
+    found = []
+    for pat in patterns:
+        try:
+            found.extend(glob.glob(pat, recursive=True))
+        except Exception:
+            pass
+    # Also near this script
+    for d in (Path(__file__).parent, Path(__file__).parent.parent):
+        for f in d.rglob("CAENRFIDLib.dll"):
+            found.append(str(f))
+
+    found = list(dict.fromkeys(found))  # deduplicate, preserve order
+
+    if found:
+        print(f"  Found {len(found)} DLL(s):")
+        for d in found:
+            print(f"    {d}")
+        dll_path = found[0]
+        print(f"\n  Using: {dll_path}")
+    else:
+        print("  No CAENRFIDLib.dll found automatically.")
+        dll_path = input("\n  Paste full path to 64-bit CAENRFIDLib.dll (or Enter to skip): ").strip()
+        if not dll_path or not os.path.exists(dll_path):
+            print("  Skipping DLL test.")
+            dll_path = ""
+
+# ── Load DLL ──────────────────────────────────────────────────────────────────
+if not dll_path:
+    print("\nNo DLL to test.")
+    sys.exit(0)
+
+print(f"\n{SEP}")
+print(f"Loading: {dll_path}")
+try:
+    lib = ctypes.WinDLL(dll_path)
+    print("  DLL loaded OK")
+except AttributeError:
+    print("  ERROR: ctypes.WinDLL not available — run this on Windows")
+    sys.exit(1)
+except OSError as e:
+    print(f"  ERROR loading DLL: {e}")
+    print("  Hint: make sure you are using the 64-bit DLL with 64-bit Python")
+    sys.exit(1)
+
+# ── List exported functions ───────────────────────────────────────────────────
+print("\nLooking for CAEN functions...")
+for name in ("CAENRFIDLib_Connect", "CAENRFIDLib_Disconnect",
+             "CAENRFIDLib_InventoryTag", "CAENRFIDLib_EventInventoryTag"):
+    try:
+        _ = getattr(lib, name)
+        print(f"  {name}  ✓ found")
+    except AttributeError:
+        print(f"  {name}  ✗ NOT found")
+
+# ── Connect ───────────────────────────────────────────────────────────────────
+COM_PORT = "COM3"
+print(f"\nConnecting to {COM_PORT} via CAENRFIDLib_Connect...")
+
+handle = ctypes.c_void_p(0)
+try:
+    lib.CAENRFIDLib_Connect.restype  = ctypes.c_int
+    lib.CAENRFIDLib_Connect.argtypes = [
+        ctypes.c_char_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    ret = lib.CAENRFIDLib_Connect(COM_PORT.encode(), ctypes.byref(handle))
+    print(f"  Return code: {ret}  Handle: {handle.value}")
+    if ret == 0:
+        print("  Connected OK!")
+    else:
+        print(f"  Connect failed (code {ret})")
+        print("  Is CAEN software closed? Is the reader on COM3?")
+        sys.exit(1)
+except AttributeError:
+    print("  CAENRFIDLib_Connect not available in this DLL")
+    sys.exit(1)
+
+# ── Inventory ─────────────────────────────────────────────────────────────────
+print("\nRunning inventory (wave a tag over the reader)...")
+
+# CAENRFIDTag struct layout from CAENRFIDTypes.h SDK 5.0.0
+class _TimeVal(ctypes.Structure):
+    _fields_ = [("tv_sec", ctypes.c_int32), ("tv_usec", ctypes.c_int32)]
+
+class CAENRFIDTag(ctypes.Structure):
+    _fields_ = [
+        ("ID",                    ctypes.c_ubyte * 64),
+        ("Length",                ctypes.c_int16),
+        ("LogicalSource",         ctypes.c_char  * 30),
+        ("ReadPoint",             ctypes.c_char  * 5),
+        ("TimeStamp",             _TimeVal),
+        ("Type",                  ctypes.c_int32),
+        ("RSSI",                  ctypes.c_int16),
+        ("TID",                   ctypes.c_ubyte * 64),
+        ("TIDLen",                ctypes.c_int16),
+        ("XPC",                   ctypes.c_ubyte * 4),
+        ("PC",                    ctypes.c_ubyte * 2),
+        ("phaseBegin",            ctypes.c_float),
+        ("phaseEnd",              ctypes.c_float),
+        ("frequency",             ctypes.c_int32),
+        ("subCmdCode",            ctypes.c_int32),
+        ("subCmdResultCode",      ctypes.c_int32),
+        ("subCmdResultDataCount", ctypes.c_int16),
+        ("subCmdResultData",      ctypes.c_void_p),
+    ]
+
+print(f"  CAENRFIDTag sizeof = {ctypes.sizeof(CAENRFIDTag)} bytes (expected 224)")
+
+lib.CAENRFIDLib_InventoryTag.restype  = ctypes.c_int
+lib.CAENRFIDLib_InventoryTag.argtypes = [
+    ctypes.c_void_p,
+    ctypes.POINTER(ctypes.c_void_p),
+    ctypes.POINTER(ctypes.c_uint16),
 ]
 
-found_dlls = []
-for pattern in search_paths:
-    matches = glob.glob(pattern, recursive=True)
-    found_dlls.extend(matches)
+tags_found = 0
+for attempt in range(10):
+    tags_ptr = ctypes.c_void_p(0)
+    count    = ctypes.c_uint16(0)
+    ret      = lib.CAENRFIDLib_InventoryTag(handle, ctypes.byref(tags_ptr), ctypes.byref(count))
+    print(f"  Attempt {attempt+1}: ret={ret}  count={count.value}", end="")
 
-# Also search the current directory and parent
-for extra in [Path(__file__).parent, Path(__file__).parent.parent]:
-    for f in extra.glob("**/*.dll"):
-        if "caen" in f.name.lower():
-            found_dlls.append(str(f))
-
-found_dlls = list(set(found_dlls))
-
-if found_dlls:
-    print(f"  Found {len(found_dlls)} CAEN DLL(s):")
-    for d in found_dlls:
-        print(f"    {d}")
-else:
-    print("  No CAENrfid.dll found in standard locations.")
-    print("\n  To fix this:")
-    print("  1. Find where your CAEN software is installed")
-    print("  2. Look for CAENrfid.dll in that folder")
-    print("  3. Copy the full path and paste it below")
-    dll_path = input("\n  Paste the full path to CAENrfid.dll (or press Enter to skip): ").strip()
-    if dll_path and os.path.exists(dll_path):
-        found_dlls = [dll_path]
+    if ret == 0 and count.value > 0 and tags_ptr.value:
+        array_type = CAENRFIDTag * count.value
+        tags = ctypes.cast(tags_ptr, ctypes.POINTER(array_type)).contents
+        print()
+        for tag in tags:
+            if tag.Length > 0:
+                epc = bytes(tag.ID[:tag.Length]).hex().upper()
+                print(f"    TAG  EPC={epc}  RSSI={tag.RSSI} dBm")
+                tags_found += 1
     else:
-        print("\n  Skipping DLL test.")
-        found_dlls = []
+        print("  (no tags)" if ret in (0, -13) else f"  (error {ret})")
 
-# ── Try loading and using the DLL ─────────────────────────────────────────────
-for dll_path in found_dlls[:1]:   # try the first one found
-    print(f"\nLoading: {dll_path}")
-    try:
-        lib = ctypes.WinDLL(dll_path)
-        print("  DLL loaded OK")
-    except OSError as e:
-        print(f"  Failed to load: {e}")
-        continue
+    time.sleep(0.5)
 
-    # ── Try connecting ─────────────────────────────────────────────────────
-    # CAEN SDK connection types: 0=USB, 1=RS232, 2=TCP/IP
-    # CAENRFID_Connect(int connType, void* connParam, int* handle)
-    handle = ctypes.c_int32(-1)
+# ── Disconnect ────────────────────────────────────────────────────────────────
+print("\nDisconnecting...")
+try:
+    lib.CAENRFIDLib_Disconnect.restype  = ctypes.c_int
+    lib.CAENRFIDLib_Disconnect.argtypes = [ctypes.c_void_p]
+    lib.CAENRFIDLib_Disconnect(handle)
+    print("  Disconnected OK")
+except AttributeError:
+    pass
 
-    print("\n  Trying USB connection (type 0)...")
-    try:
-        lib.CAENRFID_Connect.restype  = ctypes.c_int
-        lib.CAENRFID_Connect.argtypes = [
-            ctypes.c_int,
-            ctypes.c_void_p,
-            ctypes.POINTER(ctypes.c_int32)
-        ]
-        ret = lib.CAENRFID_Connect(0, None, ctypes.byref(handle))
-        print(f"  Return code: {ret}  Handle: {handle.value}")
-        if ret == 0:
-            print("  USB connection OK!")
-        else:
-            print(f"  USB failed (code {ret}), trying RS232/COM3...")
-            com = ctypes.c_char_p(b"COM3")
-            ret = lib.CAENRFID_Connect(1, com, ctypes.byref(handle))
-            print(f"  RS232 return code: {ret}  Handle: {handle.value}")
-            if ret == 0:
-                print("  RS232 connection OK!")
-    except AttributeError:
-        print("  CAENRFID_Connect not found — trying alternate function names...")
-        funcs = [name for name in dir(lib) if "connect" in name.lower() or "open" in name.lower()]
-        print(f"  Available functions with 'connect'/'open': {funcs}")
-
-    # ── If connected, try reading tags ──────────────────────────────────────
-    if handle.value >= 0:
-        print("\n  Connected! Trying to read tags...")
-        print("  (Wave a bib tag over the reader now)")
-        time.sleep(3)
-
-        # Try GetTagData or similar
-        try:
-            buf = ctypes.create_string_buffer(256)
-            ret2 = lib.CAENRFID_GetTagData(handle, buf)
-            print(f"  GetTagData returned {ret2}, data: {buf.raw[:32].hex()}")
-        except AttributeError:
-            pass
-
-        # Disconnect
-        try:
-            lib.CAENRFID_Disconnect(handle)
-            print("  Disconnected OK")
-        except AttributeError:
-            pass
-
-print("\n" + "=" * 60)
-print("Done — paste the full output above.")
-print("=" * 60)
+print(f"\n{SEP}")
+print(f"Done — {tags_found} tag read(s) captured.")
+print("Paste the full output above to confirm the setup works.")
+print(SEP)
