@@ -247,12 +247,6 @@ if not loadable:
     print("No loadable DLLs found. Fix the issues above and re-run.")
     sys.exit(1)
 
-# ── Try to connect using the best available DLL ───────────────────────────────
-COM_PORT = "COM3"
-print(SEP)
-print(f"Attempting connection on {COM_PORT}...\n")
-
-
 # ── CAEN SDK ctypes structures ─────────────────────────────────────────────────
 class _TimeVal(ctypes.Structure):
     _fields_ = [("tv_sec", ctypes.c_int32), ("tv_usec", ctypes.c_int32)]
@@ -281,100 +275,151 @@ class CAENRFIDTag(ctypes.Structure):
 
 print(f"CAENRFIDTag sizeof = {ctypes.sizeof(CAENRFIDTag)} bytes (expected 224 on x64)")
 
+# ── Test raw COM port access (before touching the DLL) ────────────────────────
+COM_PORT = "COM3"
+print(SEP)
+print(f"Testing raw COM port access on {COM_PORT}...")
+
+_k32 = ctypes.windll.kernel32
+_k32.CreateFileW.restype  = ctypes.c_void_p
+_k32.CreateFileW.argtypes = [
+    ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32,
+    ctypes.c_void_p,  ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p,
+]
+_GENERIC_RW   = 0xC0000000   # GENERIC_READ | GENERIC_WRITE
+_OPEN_EXIST   = 3
+_INVALID      = ctypes.c_size_t(-1).value  # 0xFFFF...FFFF
+
+_WIN_ERRORS = {2: "Not found", 5: "Access denied", 32: "Sharing violation (port already open)"}
+
+_com_ok = False
+for _fmt in [COM_PORT, rf"\\.\{COM_PORT}"]:
+    h = _k32.CreateFileW(_fmt, _GENERIC_RW, 0, None, _OPEN_EXIST, 0, None)
+    if h is not None and (h & _INVALID) != _INVALID:
+        print(f"  {_fmt!r}: accessible")
+        _k32.CloseHandle(ctypes.c_void_p(h))
+        _com_ok = True
+    else:
+        err = _k32.GetLastError()
+        print(f"  {_fmt!r}: FAILED — {_WIN_ERRORS.get(err, f'error {err}')}")
+
+if not _com_ok:
+    print(f"""
+  *** {COM_PORT} is NOT accessible! ***
+
+  The CAEN DLL will crash with "access violation reading 0xFFFFFFFFFFFFFFFF"
+  because Windows's INVALID_HANDLE_VALUE (-1) is being dereferenced.
+
+  To fix:
+    1. Close CAEN RFID Lab, R2RF, or any software that uses COM3
+    2. Close any other Python windows running rfid scripts
+    3. Unplug and replug the reader, wait 5 seconds
+    4. Re-run this script
+
+  If the problem persists, check Device Manager > Ports (COM & LPT)
+  to confirm COM3 appears as "USB Serial Device".
+""")
+    sys.exit(1)
+
+# ── Connection attempts ───────────────────────────────────────────────────────
+print(f"\n{SEP}")
+print(f"Attempting CAEN connection...\n")
+
 connected = False
 tags_found = 0
 
-for dll_path, lib, api_style in loadable:
-    print(f"\nTrying: {dll_path}  (API: {api_style})")
+# Wire up CAENRFID_Init once (use the first loadable x64 DLL)
+lib = loadable[0][1]
+dll_path = loadable[0][0]
+print(f"Using: {dll_path}")
 
-        # easyReader API: CAENRFID_Init(int connType, void* param, void** handle)
-    # connType 0 = RS232 (use for USB virtual COM port like COM3)
-    # connType 3 = USB direct
+lib.CAENRFID_Init.restype  = ctypes.c_int
+lib.CAENRFID_Init.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+
+handle = ctypes.c_void_p(0)
+
+# Try every (connType, portParam) combination until one works
+_attempts = [
+    (0, COM_PORT,          f"RS232  port={COM_PORT!r}"),
+    (0, rf"\\.\{COM_PORT}", f"RS232  port='\\\\.\\{COM_PORT}'"),
+    (3, None,              "USB direct (connType=3, param=NULL)"),
+]
+
+for conn_type, port_param, label in _attempts:
     handle = ctypes.c_void_p(0)
+    param  = ctypes.c_char_p(port_param.encode()) if port_param else None
+    print(f"  Trying {label} ...")
     try:
-        lib.CAENRFID_Init.restype  = ctypes.c_int
-        lib.CAENRFID_Init.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
-
-        print(f"  Trying CAENRFID_Init RS232 on {COM_PORT}...")
-        com = ctypes.c_char_p(COM_PORT.encode())
-        ret = lib.CAENRFID_Init(0, com, ctypes.byref(handle))
-        print(f"    returned {ret}, handle={handle.value}")
-
-        if ret != 0:
-            print(f"  Trying CAENRFID_Init USB direct...")
-            handle = ctypes.c_void_p(0)
-            ret = lib.CAENRFID_Init(3, None, ctypes.byref(handle))
-            print(f"    returned {ret}, handle={handle.value}")
-
-        if ret == 0:
+        ret = lib.CAENRFID_Init(conn_type, param, ctypes.byref(handle))
+        print(f"    returned {ret},  handle={handle.value}")
+        if ret == 0 and handle.value:
             connected = True
+            break
         else:
-            print(f"  Could not connect (last code: {ret})")
-    except AttributeError:
-        print("  CAENRFID_Init not available in this DLL")
-
-    if not connected:
-        continue
-
-    # ── Run inventory ──────────────────────────────────────────────────────────
-    print("\n  Running inventory — wave a tag over the reader now...")
-    try:
-        lib.CAENRFID_InventoryTag.restype  = ctypes.c_int
-        lib.CAENRFID_InventoryTag.argtypes = [
-            ctypes.c_void_p,                      # Handle
-            ctypes.c_char_p,                      # SourceName
-            ctypes.c_char_p,                      # Mask (NULL = no filter)
-            ctypes.c_ubyte,                       # MaskLength
-            ctypes.c_ubyte,                       # MaskPosition
-            ctypes.POINTER(ctypes.c_void_p),      # CAENRFIDTag** (DLL allocates)
-            ctypes.POINTER(ctypes.c_uint16),      # TagCount*
-        ]
-    except AttributeError:
-        print("  CAENRFID_InventoryTag not found")
+            print(f"    (failed — error code {ret})")
+    except OSError as e:
+        print(f"    CRASHED: {e}")
+        print("    (DLL crashed internally — probably CreateFile failed despite our test above)")
+        print("    Unplug/replug the reader and try again.\n")
         break
 
-    for attempt in range(10):
-        tags_ptr = ctypes.c_void_p(0)
-        count    = ctypes.c_uint16(0)
-        ret = lib.CAENRFID_InventoryTag(
-            handle, b"Source_0", None, 0, 0,
-            ctypes.byref(tags_ptr), ctypes.byref(count)
-        )
-        print(f"  Attempt {attempt+1}: ret={ret}  count={count.value}", end="")
+if not connected:
+    print(f"\n{SEP}")
+    print("Could not establish a connection. Review the output above.")
+    print(SEP)
+    sys.exit(1)
 
-        if ret == 0 and count.value > 0 and tags_ptr.value:
-            array_type = CAENRFIDTag * count.value
-            tags = ctypes.cast(tags_ptr, ctypes.POINTER(array_type)).contents
-            print()
-            for tag in tags:
-                if tag.Length > 0:
-                    epc = bytes(tag.ID[:tag.Length]).hex().upper()
-                    print(f"    ✓  EPC={epc}  RSSI={tag.RSSI} dBm")
-                    tags_found += 1
-        else:
-            print("  (no tags)" if ret in (0, -13) else f"  (error {ret})")
-        time.sleep(0.5)
+# ── Run inventory ─────────────────────────────────────────────────────────────
+print("\n  Running inventory — wave a tag over the reader now...")
+lib.CAENRFID_InventoryTag.restype  = ctypes.c_int
+lib.CAENRFID_InventoryTag.argtypes = [
+    ctypes.c_void_p,                  # Handle
+    ctypes.c_char_p,                  # SourceName
+    ctypes.c_char_p,                  # Mask (NULL = no filter)
+    ctypes.c_ubyte,                   # MaskLength
+    ctypes.c_ubyte,                   # MaskPosition
+    ctypes.POINTER(ctypes.c_void_p),  # CAENRFIDTag** (DLL allocates)
+    ctypes.POINTER(ctypes.c_uint16),  # TagCount*
+]
 
-    # Free last tag allocation and disconnect
-    try:
-        lib.CAENRFID_FreeTagsMemory.restype  = ctypes.c_int
-        lib.CAENRFID_FreeTagsMemory.argtypes = [ctypes.c_void_p]
-    except AttributeError:
-        pass
+for attempt in range(10):
+    tags_ptr = ctypes.c_void_p(0)
+    count    = ctypes.c_uint16(0)
+    ret = lib.CAENRFID_InventoryTag(
+        handle, b"Source_0", None, 0, 0,
+        ctypes.byref(tags_ptr), ctypes.byref(count),
+    )
+    print(f"  Attempt {attempt+1}: ret={ret}  count={count.value}", end="")
 
-    try:
-        lib.CAENRFID_End.restype  = ctypes.c_int
-        lib.CAENRFID_End.argtypes = [ctypes.c_void_p]
-        lib.CAENRFID_End(handle)
-        print("\n  Disconnected OK")
-    except AttributeError:
-        pass
-    break
+    if ret == 0 and count.value > 0 and tags_ptr.value:
+        array_type = CAENRFIDTag * count.value
+        tags = ctypes.cast(tags_ptr, ctypes.POINTER(array_type)).contents
+        print()
+        for tag in tags:
+            if tag.Length > 0:
+                epc = bytes(tag.ID[:tag.Length]).hex().upper()
+                print(f"    ✓  EPC={epc}  RSSI={tag.RSSI} dBm")
+                tags_found += 1
+    else:
+        print("  (no tags)" if ret in (0, -13) else f"  (error {ret})")
+    time.sleep(0.5)
+
+# Free + disconnect
+try:
+    lib.CAENRFID_FreeTagsMemory.restype  = ctypes.c_int
+    lib.CAENRFID_FreeTagsMemory.argtypes = [ctypes.c_void_p]
+except AttributeError:
+    pass
+
+try:
+    lib.CAENRFID_End.restype  = ctypes.c_int
+    lib.CAENRFID_End.argtypes = [ctypes.c_void_p]
+    lib.CAENRFID_End(handle)
+    print("\n  Disconnected OK")
+except AttributeError:
+    pass
 
 print(f"\n{SEP}")
 print(f"Done — {tags_found} tag read(s) captured.")
-if connected:
-    print("Connection worked! If you got tag reads above, main.py is ready to use.")
-else:
-    print("Could not connect. Review the DLL load errors above.")
+print("Connection worked! If you got tag reads above, main.py is ready to use.")
 print(SEP)
