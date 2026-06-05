@@ -1,104 +1,89 @@
 #!/usr/bin/env python3
 """
-Printer protocol diagnostic tool.
-Connects to the printer and tries several approaches to figure out
-what protocol it actually uses. Run this and paste the output here.
+CAEN R1210IX diagnostic tool.
+Opens the COM port, sends each command, and dumps exactly what comes back.
+Run this and paste the output so the protocol can be verified.
 """
 
-import socket
-import time
 import json
+import struct
+import time
 from pathlib import Path
 
-# Load IP/port from settings.json
-settings_path = Path(__file__).parent / "settings.json"
-with open(settings_path) as f:
-    s = json.load(f)
+import serial
 
-IP   = s.get("ip",   "192.168.50.169")
-PORT = s.get("port", 6101)
+# ── Load settings ──────────────────────────────────────────────────────────────
+s = json.loads((Path(__file__).parent / "settings.json").read_text())
+PORT = s.get("comPort", "COM3")
+BAUD = s.get("baudRate", 115200)
 
-WAIT = 3.0  # seconds to wait for a response each time
+STX, ETX = 0x02, 0x03
 
-def recv_all(sock, timeout=WAIT):
+def crc16(data: bytes) -> int:
+    crc = 0xFFFF
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0xA001 if crc & 1 else crc >> 1
+    return crc
+
+def frame(cmd: int, data: bytes = b"") -> bytes:
+    payload = bytes([cmd]) + data
+    body    = struct.pack("<H", len(payload)) + payload
+    return bytes([STX]) + body + struct.pack("<H", crc16(body)) + bytes([ETX])
+
+def recv(ser: serial.Serial, wait=1.5) -> bytes:
     buf = b""
-    sock.settimeout(timeout)
-    deadline = time.time() + timeout
+    deadline = time.time() + wait
     while time.time() < deadline:
-        try:
-            chunk = sock.recv(4096)
-            if not chunk:
-                break
+        chunk = ser.read(256)
+        if chunk:
             buf += chunk
-            sock.settimeout(0.3)   # keep reading if more arrives quickly
-        except socket.timeout:
-            break
-        except OSError:
-            break
+            deadline = time.time() + 0.4   # keep reading if data arrives
     return buf
 
-def show(label, data):
+def show(label: str, data: bytes):
     if data:
-        print(f"\n>>> {label}")
+        print(f"  ← {label} ({len(data)} bytes)")
         print(f"    HEX : {data.hex()}")
         print(f"    TEXT: {data!r}")
     else:
-        print(f"\n>>> {label}: (nothing received)")
-
-def try_send(sock, label, payload):
-    print(f"\nSending [{label}]: {payload!r}  hex={payload.hex()}")
-    try:
-        sock.sendall(payload)
-    except OSError as e:
-        print(f"  Send failed: {e}")
-        return
-    resp = recv_all(sock)
-    show(f"Response to [{label}]", resp)
+        print(f"  ← {label}: (nothing)")
 
 print("=" * 60)
-print(f"Connecting to {IP}:{PORT} ...")
+print(f"CAEN R1210IX Diagnostic  —  {PORT} @ {BAUD} baud")
 print("=" * 60)
 
 try:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(5)
-    sock.connect((IP, PORT))
-    print("Connected.\n")
-except OSError as e:
-    print(f"FAILED to connect: {e}")
+    ser = serial.Serial(PORT, BAUD, timeout=0.1)
+    print(f"Port opened OK\n")
+except serial.SerialException as e:
+    print(f"FAILED to open {PORT}: {e}")
     raise SystemExit(1)
 
-# 1. Listen first — does the printer say anything on its own?
-print("Listening for unsolicited data (3 seconds)...")
-first = recv_all(sock)
-show("Unsolicited data", first)
+steps = [
+    ("Open Reader",      frame(0x01)),
+    ("Set GEN2 proto",   frame(0x03, b"\x00")),
+    ("Set power 30dBm",  frame(0x04, struct.pack("<H", 3000))),
+    ("Start inventory",  frame(0x05)),
+]
 
-# 2. Plain newline
-try_send(sock, "CRLF",          b"\r\n")
+for label, cmd in steps:
+    print(f"→ {label}:  {cmd.hex()}")
+    ser.write(cmd)
+    resp = recv(ser)
+    show("response", resp)
+    time.sleep(0.2)
 
-# 3. Question mark (some devices send a help/menu)
-try_send(sock, "?",             b"?\r\n")
+print("\nListening for tag reads for 10 seconds — wave a tag over the reader now...")
+tag_data = recv(ser, wait=10)
+show("Tag reads", tag_data)
 
-# 4. ZPL host-status query
-try_send(sock, "ZPL ~HS",       b"~HS\r\n")
+print("\n→ Stop inventory:", frame(0x06).hex())
+ser.write(frame(0x06))
+show("response", recv(ser))
 
-# 5. SGD get all (Zebra Link-OS)
-try_send(sock, "SGD get all",   b"! U1 getvar \"all\"\r\n")
-
-# 6. Common RFID text commands
-try_send(sock, "RFID SETUP",    b"RFID SETUP\r\n")
-try_send(sock, "RFID READ",     b"RFID READ\r\n")
-try_send(sock, "GET TAGS",      b"GET TAGS\r\n")
-try_send(sock, "INVENTORY",     b"INVENTORY\r\n")
-
-# 7. Single STX byte (start of many binary protocols)
-try_send(sock, "STX=0x02",      b"\x02")
-
-# 8. Common binary handshake patterns
-try_send(sock, "0x01 0x00",     b"\x01\x00")
-try_send(sock, "0xFF",          b"\xff")
-
-sock.close()
+ser.close()
 print("\n" + "=" * 60)
-print("Done. Paste the full output above back to Claude.")
+print("Done — paste this entire output for protocol verification.")
 print("=" * 60)

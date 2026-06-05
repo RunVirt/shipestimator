@@ -1,144 +1,125 @@
 #!/usr/bin/env python3
 """
-RFID Verification Tool — EliteFeats Edition
-Replaces IPICO RC5 tag decoding with a direct EPC→Bib CSV lookup.
+RFID Verification Tool — EliteFeats + CAEN R1210IX Edition
 
-Protocol note: The Zebra/IPICO printer on port 6101 uses a binary
-framed protocol. Frames are:  [1-byte cmd][2-byte len LE][payload]
-Response frames for tag reads include EPC bytes + RSSI byte per tag.
-Adjust CMD_* constants and _parse_frame() if the printer responds
-differently — enable debug=true in settings.json to log raw bytes.
+Reads tags continuously from a CAEN R1210IX Smart Tray Reader over
+USB/COM port, looks up each EPC in the EliteFeats encoding CSV, and
+flags any bib with an RSSI below the configured threshold.
+
+CAEN serial protocol (easyReader SDK):
+  Frame: STX(0x02) + LEN(2 LE) + CMD(1) + DATA(N) + CRC16(2 LE) + ETX(0x03)
+  Inventory response frames arrive continuously once inventory is started.
+  Each tag frame contains: EPC length, EPC bytes, RSSI (signed, 1/10 dBm).
 """
 
 import csv
 import json
 import logging
 import os
-import socket
+import struct
 import sys
 import threading
 import time
 import webbrowser
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
-from flask import Flask, request
-from flask_socketio import SocketIO, emit, disconnect
+import serial
+from flask import Flask
+from flask_socketio import SocketIO, emit
 
 # ─── Settings ─────────────────────────────────────────────────────────────────
 
 SETTINGS_FILE = Path(__file__).parent / "settings.json"
 
 DEFAULT_SETTINGS = {
-    "ip": "192.168.50.169",
-    "port": 6101,
-    "readPower": 30,
-    "tagPosition": "F0",
-    "batchSize": 50,
-    "timeout": 20,
-    "dataDir": "data",
-    "filePrefix": "rfid_reads",
-    "encodingDb": "EliteFeats_115000__Sheet1.csv",
+    "comPort":      "COM3",
+    "baudRate":     115200,
+    "readPower":    30,
+    "dataDir":      "data",
+    "filePrefix":   "rfid_reads",
+    "encodingDb":   "EliteFeats_115000__Sheet1.csv",
     "rssiThreshold": -70,
-    "webPort": 8765,
-    "debug": False,
+    "webPort":      8765,
+    "debug":        False,
 }
 
 def load_settings() -> dict:
     if SETTINGS_FILE.exists():
         with open(SETTINGS_FILE) as f:
-            s = json.load(f)
-        merged = {**DEFAULT_SETTINGS, **s}
-        return merged
+            return {**DEFAULT_SETTINGS, **json.load(f)}
     return DEFAULT_SETTINGS.copy()
 
 def save_settings(s: dict):
     with open(SETTINGS_FILE, "w") as f:
         json.dump(s, f, indent=2)
 
-# ─── RFID Error Codes (matches Zebra/IPICO firmware strings) ─────────────────
+# ─── RFID Error descriptions ───────────────────────────────────────────────────
 
 RFID_ERRORS: Dict[int, str] = {
-    0x00: "RFID OK",
+    0x00: "OK",
     0x01: "NO TAG FOUND",
-    0x02: "TAG ID BUFFER FULL",
-    0x03: "BAD RFID DATA",
-    0x04: "INVALID ADDRESS",
-    0x05: "LOCK ERROR",
-    0x06: "GENERAL TAG ERROR",
-    0x07: "INVALID WRITE DATA",
-    0x08: "DATA AMOUNT ERROR",
-    0x09: "INVALID PARAMETER",
-    0x0A: "INVALID PROTOCOL",
-    0x0B: "INVALID FREQUENCY",
-    0x0C: "PROTOCOL UNDEFINED",
-    0x0D: "PROTOCOL BAD EPC",
-    0x0E: "PROT BAD NUM DATA",
-    0x0F: "GEN2 PROTOCOL ERR",
-    0x10: "UNKNOWN OPCODE",
-    0x11: "RDR COMM TIMEOUT",
-    0x12: "TM ASSERT FAILED",
+    0x02: "READ ERROR",
+    0x03: "CRC ERROR",
+    0x04: "PROTOCOL ERROR",
+    0xFF: "UNKNOWN ERROR",
 }
 
-# ─── ZPL command builders ─────────────────────────────────────────────────────
-# Zebra printers speak ZPL (Zebra Programming Language) over TCP.
-# ^XA / ^XZ  = start / end of format
-# ^RS        = RFID Setup  (type, antenna, read-power, write-power, …)
-# ^RFR,H,0,12= Read RFID field: hex, starting block 0, 12 bytes (EPC)
-# ^PQ<n>     = Print/process Quantity
-# ^HV<f>,<l> = Host Verify: send field data back over the comms port
+# ─── CAEN easyReader protocol constants ───────────────────────────────────────
 
-def zpl_setup(power: int, position: str) -> bytes:
-    """Configure RFID antenna and read power. No response expected."""
-    # ^RS<type=A GEN2>,<position>,<read-power>
-    return f"^XA^RSA,{position},{power}^XZ\n".encode()
+STX = 0x02
+ETX = 0x03
 
-def zpl_clear() -> bytes:
-    return b"^XA^XZ\n"
+# Host → Reader commands
+CMD_OPEN_READER    = 0x01   # Open/initialise reader
+CMD_CLOSE_READER   = 0x02   # Close reader
+CMD_SET_PROTOCOL   = 0x03   # Set tag protocol (0x00 = GEN2/ISO18000-6C)
+CMD_SET_POWER      = 0x04   # Set RF power (uint16, dBm * 100)
+CMD_START_INV      = 0x05   # Start continuous inventory
+CMD_STOP_INV       = 0x06   # Stop inventory
 
-def zpl_pause() -> bytes:
-    return b"~PP\n"
+# Reader → Host response commands
+RESP_TAG           = 0x80   # Tag report: EPC + RSSI
+RESP_ACK           = 0x81   # Command acknowledged
+RESP_ERR           = 0x82   # Error response
+RESP_INV_END       = 0x83   # Inventory session ended
 
-def zpl_resume() -> bytes:
-    return b"~PS\n"
+MIN_FRAME = 7   # STX(1) + LEN(2) + CMD(1) + CRC(2) + ETX(1)
 
-def zpl_read_batch(batch_size: int) -> bytes:
-    """
-    ZPL format that reads the EPC from each label and sends it back to
-    the host via ^HV. The printer processes <batch_size> labels.
-    Response lines look like: <24-char hex EPC>\r\n
-    """
-    return (
-        f"^XA"
-        f"^PQ{batch_size}"
-        f"^RS"
-        f"^RFR,H,0,12"
-        f"^FN1^FD^FS"
-        f"^HV1,24"
-        f"^XZ\n"
-    ).encode()
+def _crc16(data: bytes) -> int:
+    crc = 0xFFFF
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0xA001 if crc & 1 else crc >> 1
+    return crc
+
+def _build_frame(cmd: int, data: bytes = b"") -> bytes:
+    payload = bytes([cmd]) + data
+    length  = struct.pack("<H", len(payload))
+    body    = length + payload
+    crc     = struct.pack("<H", _crc16(body))
+    return bytes([STX]) + body + crc + bytes([ETX])
 
 # ─── Encoding Database ────────────────────────────────────────────────────────
 
 class EncodingDatabase:
-    """Loads EliteFeats CSV (EPC,Bib #) and provides O(1) EPC→Bib lookup."""
+    """Loads EliteFeats CSV (EPC, Bib #) for O(1) EPC → Bib lookup."""
 
     def __init__(self, csv_path: str):
         self._db: Dict[str, str] = {}
-        self._load(csv_path)
-
-    def _load(self, path: str):
-        p = Path(path)
+        p = Path(csv_path)
         if not p.is_absolute():
-            p = Path(__file__).parent / path
+            p = Path(__file__).parent / csv_path
         with open(p, newline="") as f:
             for row in csv.DictReader(f):
-                epc = row["EPC"].strip().upper().lstrip("0") or "0"
-                # Store both zero-padded and stripped forms for resilience
-                self._db[row["EPC"].strip().upper()] = row["Bib #"].strip()
-                self._db[epc] = row["Bib #"].strip()
-        logging.info("Encoding DB loaded: %d tags", len(self._db) // 2)
+                epc = row["EPC"].strip().upper()
+                bib = row["Bib #"].strip()
+                self._db[epc] = bib
+                stripped = epc.lstrip("0") or "0"
+                self._db[stripped] = bib
+        logging.info("Encoding DB: %d tags loaded", len(self._db) // 2)
 
     def lookup(self, epc: str) -> Optional[str]:
         epc = epc.strip().upper()
@@ -152,7 +133,7 @@ class EncodingDatabase:
 class FailedBibTracker:
     def __init__(self):
         self._success: Set[str] = set()
-        self._failed: Set[str] = set()
+        self._failed:  Set[str] = set()
 
     def add_success(self, bib: str):
         self._success.add(bib)
@@ -163,363 +144,371 @@ class FailedBibTracker:
             self._failed.add(bib)
 
     def bibs_needing_reprint(self) -> List[str]:
-        def sort_key(b):
-            return int(b) if b.isdigit() else b
-        return sorted(self._failed, key=sort_key)
+        return sorted(self._failed, key=lambda b: int(b) if b.isdigit() else b)
 
     def reset(self):
         self._success.clear()
         self._failed.clear()
 
-# ─── Printer Connection ───────────────────────────────────────────────────────
+# ─── CAEN R1210IX Reader ──────────────────────────────────────────────────────
 
-class PrinterConnection:
+class CaenReader:
     """
-    Manages the TCP socket to the Zebra printer on port 6101.
-    Communicates using ZPL (Zebra Programming Language) text commands.
-    Tag data is returned by the printer as plain text lines over the
-    same socket, one EPC per line.
+    CAEN R1210IX Smart Tray Reader via USB/COM port.
+
+    Uses CAEN's easyReader binary protocol (STX-framed packets).
+    Runs continuous inventory in a background thread and calls
+    tag_callback(epc: str, rssi_dbm: int, err: int) for every read.
+
+    If debug=True, all raw bytes sent and received are printed so the
+    protocol can be verified against the actual reader firmware.
     """
 
-    def __init__(self, ip: str, port: int, timeout: int, debug: bool = False):
-        self.ip = ip
-        self.port = port
-        self.timeout = timeout
+    def __init__(self, port: str, baud: int, power: int, debug: bool = False):
+        self.port  = port
+        self.baud  = baud
+        self.power = power
         self.debug = debug
-        self._sock: Optional[socket.socket] = None
-        self._buf = b""
+        self._ser:  Optional[serial.Serial] = None
+        self._buf   = b""
+        self._running = False
+        self._callback: Optional[Callable] = None
 
     @property
     def connected(self) -> bool:
-        return self._sock is not None
+        return self._ser is not None and self._ser.is_open
 
     def connect(self) -> bool:
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(self.timeout)
-            s.connect((self.ip, self.port))
-            self._sock = s
+            self._ser = serial.Serial(
+                port=self.port,
+                baudrate=self.baud,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+                timeout=0.1,
+            )
             self._buf = b""
-            logging.info("Connected to printer at %s:%d", self.ip, self.port)
+            logging.info("Opened %s at %d baud", self.port, self.baud)
+
+            # Initialise reader
+            self._send(CMD_OPEN_READER)
+            time.sleep(0.2)
+            self._drain()
+
+            # Set GEN2 protocol
+            self._send(CMD_SET_PROTOCOL, bytes([0x00]))
+            time.sleep(0.1)
+            self._drain()
+
+            # Set RF power (dBm * 100, e.g. 3000 = 30.00 dBm)
+            power_raw = min(max(self.power, 0), 30) * 100
+            self._send(CMD_SET_POWER, struct.pack("<H", power_raw))
+            time.sleep(0.1)
+            self._drain()
+
             return True
-        except OSError as e:
-            logging.error("Printer connect failed: %s", e)
+        except serial.SerialException as e:
+            logging.error("CAEN connect failed: %s", e)
             return False
 
     def disconnect(self):
-        if self._sock:
+        self._running = False
+        if self._ser and self._ser.is_open:
             try:
-                self._sock.close()
-            except OSError:
+                self._send(CMD_STOP_INV)
+                time.sleep(0.05)
+                self._send(CMD_CLOSE_READER)
+                time.sleep(0.05)
+                self._ser.close()
+            except Exception:
                 pass
-            self._sock = None
+        self._ser = None
 
-    def send_setup(self, power: int, position: str):
-        cmd = zpl_setup(power, position)
-        self._send(cmd)
-        logging.info("RFID setup sent: power=%d pos=%s", power, position)
+    def start_inventory(self, callback: Callable):
+        self._callback = callback
+        self._running  = True
+        self._send(CMD_START_INV)
+        t = threading.Thread(target=self._read_loop, daemon=True, name="caen-rx")
+        t.start()
 
-    def clear_buffer(self):
-        self._send(zpl_clear())
-
-    def pause_printer(self):
-        self._send(zpl_pause())
-
-    def resume_printer(self):
-        self._send(zpl_resume())
-
-    def read_batch(self, batch_size: int) -> List[Tuple[str, int, int]]:
-        """
-        Send ZPL to process a batch of labels, collect EPC responses.
-        Returns list of (epc_hex_str, rssi_dBm, error_code).
-        RSSI is 0 when the printer does not report it; error_code 0 = OK.
-        """
-        self._send(zpl_read_batch(batch_size))
-        return self._recv_lines(batch_size)
+    def stop_inventory(self):
+        self._running = False
+        self._send(CMD_STOP_INV)
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
-    def _send(self, data: bytes):
-        if not self._sock:
+    def _send(self, cmd: int, data: bytes = b""):
+        if not (self._ser and self._ser.is_open):
             return
+        frame = _build_frame(cmd, data)
         if self.debug:
-            print(f"TX: {data!r}", flush=True)
+            print(f"TX: {frame.hex()}  ({frame!r})", flush=True)
         try:
-            self._sock.sendall(data)
-        except OSError as e:
-            logging.error("Send error: %s", e)
-            self.disconnect()
+            self._ser.write(frame)
+        except serial.SerialException as e:
+            logging.error("Serial write error: %s", e)
 
-    def _recv_lines(self, expected: int) -> List[Tuple[str, int, int]]:
-        """
-        Read newline-delimited responses from the printer.
-        In debug mode, also dumps the raw bytes so we can see the
-        actual format and adjust the parser if needed.
-        """
-        tags: List[Tuple[str, int, int]] = []
-        deadline = time.time() + self.timeout
+    def _drain(self):
+        """Read and discard any pending bytes (e.g. ACKs after setup cmds)."""
+        if not (self._ser and self._ser.is_open):
+            return
+        time.sleep(0.05)
+        pending = self._ser.in_waiting
+        if pending:
+            data = self._ser.read(pending)
+            if self.debug:
+                print(f"DRAIN ({len(data)} bytes): {data.hex()}  {data!r}", flush=True)
 
-        while len(tags) < expected and time.time() < deadline:
-            remaining = max(0.5, deadline - time.time())
-            self._sock.settimeout(remaining)
+    def _read_loop(self):
+        while self._running and self._ser and self._ser.is_open:
             try:
-                chunk = self._sock.recv(4096)
-            except socket.timeout:
+                chunk = self._ser.read(256)
+            except serial.SerialException as e:
+                logging.error("Serial read error: %s", e)
                 break
-            except OSError as e:
-                logging.error("Recv error: %s", e)
-                break
+            if chunk:
+                if self.debug:
+                    print(f"RAW RX ({len(chunk)} bytes): {chunk.hex()}  {chunk!r}", flush=True)
+                self._buf += chunk
+                self._process_buf()
 
-            if not chunk:
-                break
+    def _process_buf(self):
+        while len(self._buf) >= MIN_FRAME:
+            # Find next STX
+            stx = self._buf.find(STX)
+            if stx < 0:
+                self._buf = b""
+                return
+            if stx > 0:
+                self._buf = self._buf[stx:]
+
+            if len(self._buf) < MIN_FRAME:
+                return
+
+            # Parse length field
+            length = struct.unpack_from("<H", self._buf, 1)[0]
+            frame_total = 1 + 2 + length + 2 + 1  # STX+LEN+PAYLOAD+CRC+ETX
+
+            if len(self._buf) < frame_total:
+                return  # Wait for rest of frame
+
+            frame = self._buf[:frame_total]
+            self._buf = self._buf[frame_total:]
+
+            if frame[-1] != ETX:
+                if self.debug:
+                    print(f"Bad ETX, skipping frame: {frame.hex()}", flush=True)
+                continue
+
+            # Verify CRC
+            body     = frame[1:-3]   # LEN + PAYLOAD
+            received = struct.unpack_from("<H", frame, frame_total - 3)[0]
+            expected = _crc16(body)
+            if received != expected:
+                if self.debug:
+                    print(f"CRC mismatch: got {received:04X} expected {expected:04X}", flush=True)
+                continue
+
+            cmd     = frame[3]
+            payload = frame[4:4 + length - 1]
 
             if self.debug:
-                print(f"RAW RX ({len(chunk)} bytes): {chunk.hex()}", flush=True)
-                print(f"RAW RX (text): {chunk!r}", flush=True)
+                print(f"FRAME cmd=0x{cmd:02X} payload({len(payload)}B)={payload.hex()}", flush=True)
 
-            self._buf += chunk
+            self._dispatch(cmd, payload)
 
-            # Parse complete lines
-            while b"\n" in self._buf:
-                line, self._buf = self._buf.split(b"\n", 1)
-                line = line.rstrip(b"\r").decode(errors="replace").strip()
-                if self.debug:
-                    print(f"LINE: {line!r}", flush=True)
-                parsed = self._parse_line(line)
-                if parsed:
-                    tags.append(parsed)
-                    if len(tags) >= expected:
-                        break
+    def _dispatch(self, cmd: int, payload: bytes):
+        if cmd == RESP_TAG:
+            self._handle_tag(payload)
+        elif cmd == RESP_ERR:
+            err = payload[0] if payload else 0xFF
+            logging.warning("Reader error: %s", RFID_ERRORS.get(err, f"0x{err:02X}"))
+        elif cmd == RESP_ACK:
+            logging.debug("Reader ACK")
+        elif cmd == RESP_INV_END:
+            logging.info("Inventory session ended by reader")
+        else:
+            if self.debug:
+                print(f"Unknown response cmd=0x{cmd:02X}: {payload.hex()}", flush=True)
 
-        return tags
-
-    def _parse_line(self, line: str) -> Optional[Tuple[str, int, int]]:
+    def _handle_tag(self, payload: bytes):
         """
-        Parse one response line from the printer.
-        Handles several common Zebra RFID response formats:
-          - Plain 24-char hex EPC:   000000015000...
-          - Prefixed:                EPC:000000015000
-          - Status with RSSI:        000000015000 RSSI=-55 ERR=0
-          - RFID OK / error strings: RFID OK, NO TAG FOUND, etc.
+        Tag payload: [epc_len:1][epc_bytes:epc_len][rssi:2 LE signed, 1/10 dBm]
         """
-        line = line.strip().upper()
-        if not line:
-            return None
+        if len(payload) < 3:
+            if self.debug:
+                print(f"Short tag payload: {payload.hex()}", flush=True)
+            return
 
-        # Map plain RFID status strings to error codes
-        for code, msg in RFID_ERRORS.items():
-            if line == msg:
-                if code == 0x00:
-                    return None  # "RFID OK" with no EPC — skip
-                logging.debug("Printer status: %s", msg)
-                return None
+        epc_len = payload[0]
+        if len(payload) < 1 + epc_len + 2:
+            if self.debug:
+                print(f"Incomplete tag payload: {payload.hex()}", flush=True)
+            return
 
-        # Strip common prefixes
-        for prefix in ("EPC:", "RFID:", "TAG:", "DATA:"):
-            if line.startswith(prefix):
-                line = line[len(prefix):].strip()
-                break
+        epc_bytes = payload[1:1 + epc_len]
+        epc = epc_bytes.hex().upper()
 
-        # Extract optional RSSI and ERR tokens first
-        rssi = 0
-        err  = 0
-        parts = line.split()
-        epc_candidate = parts[0] if parts else ""
-        for token in parts[1:]:
-            if token.startswith("RSSI="):
-                try:
-                    rssi = int(token[5:])
-                except ValueError:
-                    pass
-            elif token.startswith("ERR="):
-                try:
-                    err = int(token[4:])
-                except ValueError:
-                    pass
+        rssi_raw = struct.unpack_from("<h", payload, 1 + epc_len)[0]
+        rssi_dbm = rssi_raw // 10   # convert 1/10 dBm to dBm
 
-        # Validate EPC: must be 12, 24, or 16 hex chars (96-bit or 64-bit EPC)
-        epc = epc_candidate.replace(" ", "")
-        if epc and all(c in "0123456789ABCDEF" for c in epc) and len(epc) in (12, 16, 24):
-            # Normalise to 12 hex chars (6 bytes) used by EliteFeats CSV
-            if len(epc) == 24:
-                epc = epc[:12]   # first 6 bytes = EPC header + bib number
-            return (epc, rssi, err)
+        if self.debug:
+            print(f"TAG  EPC={epc}  RSSI={rssi_dbm} dBm", flush=True)
 
-        return None
+        if self._callback:
+            self._callback(epc, rssi_dbm, 0)
 
 # ─── Verification Runner ──────────────────────────────────────────────────────
 
 class VerificationRunner:
     def __init__(self, settings: dict, db: EncodingDatabase, socketio: SocketIO):
         self._settings = settings
-        self._db = db
-        self._sio = socketio
-        self._conn = PrinterConnection(
-            settings["ip"], settings["port"],
-            settings["timeout"], settings.get("debug", False),
+        self._db       = db
+        self._sio      = socketio
+        self._reader   = CaenReader(
+            port  = settings["comPort"],
+            baud  = settings.get("baudRate", 115200),
+            power = settings.get("readPower", 30),
+            debug = settings.get("debug", False),
         )
-        self._tracker = FailedBibTracker()
-        self._running = False
-        self._paused = False
-        self._lock = threading.Lock()
-
-        self.total_tested = 0
+        self._tracker  = FailedBibTracker()
+        self._running  = False
+        self._paused   = False
+        self._lock     = threading.Lock()
+        self.total_tested     = 0
         self.successful_reads = 0
-        self.failed_reads = 0
-
-    # ── Public control ────────────────────────────────────────────────────────
+        self.failed_reads     = 0
 
     def start(self):
         with self._lock:
             if self._running:
                 return
             self._running = True
-            self._paused = False
+            self._paused  = False
 
         self._tracker.reset()
-        self.total_tested = 0
-        self.successful_reads = 0
-        self.failed_reads = 0
+        self.total_tested = self.successful_reads = self.failed_reads = 0
 
-        t = threading.Thread(target=self._run, daemon=True)
+        t = threading.Thread(target=self._run, daemon=True, name="verify-runner")
         t.start()
 
     def stop(self):
         with self._lock:
             self._running = False
+        self._reader.stop_inventory()
 
     def pause(self):
         with self._lock:
             self._paused = True
-        if self._conn.connected:
-            self._conn.pause_printer()
+        self._reader.stop_inventory()
 
     def resume(self):
         with self._lock:
             self._paused = False
-        if self._conn.connected:
-            self._conn.resume_printer()
+        self._reader.start_inventory(self._on_tag)
 
     def is_running(self) -> bool:
         return self._running
 
-    # ── Internal loop ─────────────────────────────────────────────────────────
+    # ── Internal ──────────────────────────────────────────────────────────────
 
     def _run(self):
         self._broadcast("status", {"type": "status", "status": "connecting"})
 
-        if not self._conn.connect():
+        if not self._reader.connect():
             self._broadcast("status", {
-                "type": "error",
-                "error": f"Failed to connect to {self._settings['ip']}:{self._settings['port']}",
+                "type":  "error",
+                "error": f"Failed to open {self._settings['comPort']} — check the port and that the reader is plugged in",
             })
             self._running = False
             return
 
-        self._broadcast("status", {"type": "status", "status": "connected"})
-        self._conn.send_setup(
-            self._settings["readPower"],
-            self._settings["tagPosition"],
-        )
-        self._conn.clear_buffer()
+        self._broadcast("status", {"type": "status", "status": "running"})
+        self._reader.start_inventory(self._on_tag)
 
-        batch = self._settings["batchSize"]
-        rssi_threshold = self._settings.get("rssiThreshold", -70)
-
+        # Keep thread alive until stopped
         while self._running:
-            if self._paused:
-                import gevent
-                gevent.sleep(0.2)
-                continue
+            time.sleep(0.2)
 
-            try:
-                tags = self._conn.read_batch(batch)
-            except Exception as e:
-                logging.error("Read error: %s", e)
-                self._broadcast("status", {"type": "error", "error": str(e)})
-                break
-
-            for epc, rssi, err_code in tags:
-                if not self._running:
-                    break
-
-                self.total_tested += 1
-                bib = self._db.lookup(epc)
-                is_ok = err_code == 0 and bib is not None and rssi >= rssi_threshold
-
-                result = {
-                    "type": "result",
-                    "tagData": epc,
-                    "bib": bib or "UNKNOWN",
-                    "readAttempt": self.total_tested,
-                    "errorCode": err_code,
-                    "errorDesc": RFID_ERRORS.get(err_code, f"CODE 0x{err_code:02X}"),
-                    "rssi": rssi,
-                    "success": is_ok,
-                    "totalTagsTested": self.total_tested,
-                }
-
-                if is_ok:
-                    self.successful_reads += 1
-                    if bib:
-                        self._tracker.add_success(bib)
-                else:
-                    self.failed_reads += 1
-                    if bib:
-                        self._tracker.add_failure(bib)
-
-                self._broadcast("result", result)
-
-            if not tags:
-                import gevent
-                gevent.sleep(0.05)
-
-        self._conn.disconnect()
+        self._reader.disconnect()
         self._finish()
+
+    def _on_tag(self, epc: str, rssi: int, err: int):
+        """Called from the CAEN reader thread for every tag read."""
+        with self._lock:
+            if not self._running or self._paused:
+                return
+
+        self.total_tested += 1
+        bib   = self._db.lookup(epc)
+        is_ok = err == 0 and bib is not None and rssi >= self._settings.get("rssiThreshold", -70)
+
+        result = {
+            "type":          "result",
+            "tagData":       epc,
+            "bib":           bib or "UNKNOWN",
+            "readAttempt":   self.total_tested,
+            "errorCode":     err,
+            "errorDesc":     RFID_ERRORS.get(err, f"CODE 0x{err:02X}"),
+            "rssi":          rssi,
+            "success":       is_ok,
+            "totalTagsTested": self.total_tested,
+        }
+
+        if is_ok:
+            self.successful_reads += 1
+            if bib:
+                self._tracker.add_success(bib)
+        else:
+            self.failed_reads += 1
+            if bib:
+                self._tracker.add_failure(bib)
+
+        self._broadcast("result", result)
 
     def _finish(self):
         bibs = self._tracker.bibs_needing_reprint()
         summary = {
-            "type": "summary",
-            "totalTagsTested": self.total_tested,
-            "successfulReads": self.successful_reads,
-            "failedReads": self.failed_reads,
+            "type":              "summary",
+            "totalTagsTested":   self.total_tested,
+            "successfulReads":   self.successful_reads,
+            "failedReads":       self.failed_reads,
             "bibsNeedingReprint": bibs,
-            "success": len(bibs) == 0,
+            "success":           len(bibs) == 0,
         }
 
         if bibs:
-            lines = [f" {b}" for b in bibs]
-            logging.warning("%d bib numbers failed and need manual reprinting:\n%s",
-                            len(bibs), "\n".join(lines))
+            logging.warning("%d bib(s) need manual reprinting: %s",
+                            len(bibs), ", ".join(bibs[:10]) + ("…" if len(bibs) > 10 else ""))
         else:
-            logging.info("All bib numbers were successfully printed!")
+            logging.info("All bib numbers verified successfully!")
 
         self._write_csv(summary)
-        self._broadcast("summary", summary)
-        self._broadcast("status", {"type": "status", "status": "stopped"})
+        self._broadcast("summary",  summary)
+        self._broadcast("status",   {"type": "status", "status": "stopped"})
         self._running = False
 
     def _write_csv(self, summary: dict):
         data_dir = Path(__file__).parent / self._settings["dataDir"]
         data_dir.mkdir(parents=True, exist_ok=True)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = data_dir / f"{self._settings['filePrefix']}_{ts}.csv"
 
         with open(path, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["Timestamp", "Total Tested", "Successful", "Failed",
                         "Bibs Needing Reprint"])
-            w.writerow([ts, summary["totalTagsTested"],
-                        summary["successfulReads"], summary["failedReads"],
+            w.writerow([ts, summary["totalTagsTested"], summary["successfulReads"],
+                        summary["failedReads"],
                         "; ".join(summary["bibsNeedingReprint"])])
             if summary["bibsNeedingReprint"]:
                 w.writerow([])
-                w.writerow(["IMPORT ANALYSIS: Bib Numbers Needing Manual Reprint"])
+                w.writerow(["Bib Numbers Needing Manual Reprint"])
                 for bib in summary["bibsNeedingReprint"]:
                     w.writerow([bib])
 
-        logging.info("Summary saved: %s", path)
+        logging.info("Report saved: %s", path)
 
     def _broadcast(self, event: str, data: dict):
         self._sio.emit(event, data)
@@ -528,26 +517,20 @@ class VerificationRunner:
 
 def import_csv_and_analyze(csv_path: str, db: EncodingDatabase,
                            rssi_threshold: int) -> dict:
-    """
-    Analyze a previously saved rfid_reads CSV against the encoding DB.
-    Expected columns: EPC, RSSI  (other columns ignored).
-    Returns a summary dict matching the live-run format.
-    """
+    """Analyze a previously saved rfid_reads CSV against the encoding DB."""
+    from collections import defaultdict
     tracker = FailedBibTracker()
-    total = 0
-    ok = 0
+    total = ok = 0
 
-    logging.info("Importing and analyzing CSV file: %s", csv_path)
+    logging.info("Analyzing: %s", csv_path)
     with open(csv_path, newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
+        for row in csv.DictReader(f):
             epc = row.get("EPC", row.get("tagData", "")).strip().upper()
             if not epc:
                 continue
             total += 1
-            rssi_raw = row.get("RSSI", row.get("rssi", "0")).strip()
             try:
-                rssi = int(rssi_raw)
+                rssi = int(row.get("RSSI", row.get("rssi", "0")).strip())
             except ValueError:
                 rssi = 0
             bib = db.lookup(epc)
@@ -558,39 +541,28 @@ def import_csv_and_analyze(csv_path: str, db: EncodingDatabase,
                 tracker.add_failure(bib)
 
     bibs = tracker.bibs_needing_reprint()
-    logging.info("IMPORT ANALYSIS: Bib Numbers Needing Manual Reprint")
-    for b in bibs:
-        logging.info("  %s", b)
-
     return {
-        "type": "summary",
-        "totalTagsTested": total,
-        "successfulReads": ok,
-        "failedReads": total - ok,
+        "type":              "summary",
+        "totalTagsTested":   total,
+        "successfulReads":   ok,
+        "failedReads":       total - ok,
         "bibsNeedingReprint": bibs,
-        "success": len(bibs) == 0,
+        "success":           len(bibs) == 0,
     }
 
-# ─── Flask / SocketIO App ─────────────────────────────────────────────────────
+# ─── Flask / SocketIO ─────────────────────────────────────────────────────────
 
-app = Flask(__name__, static_folder="static")
-app.config["SECRET_KEY"] = "rfidverify-elitefeats"
+app     = Flask(__name__, static_folder="static")
+app.config["SECRET_KEY"] = "rfidverify-elitefeats-caen"
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="gevent")
 
 _settings: dict = {}
-_db: Optional[EncodingDatabase] = None
-_runner: Optional[VerificationRunner] = None
+_db:       Optional[EncodingDatabase] = None
+_runner:   Optional[VerificationRunner] = None
 
 @app.route("/")
 def index():
     return app.send_static_file("index.html")
-
-@app.route("/api/settings")
-def api_settings():
-    from flask import jsonify
-    return jsonify(_settings)
-
-# ── WebSocket handlers ────────────────────────────────────────────────────────
 
 @socketio.on("connect")
 def on_connect():
@@ -630,14 +602,12 @@ def on_resume(data=None):
 @socketio.on("settings")
 def on_settings(data: dict):
     global _settings, _db
-    allowed = {"ip", "port", "readPower", "tagPosition", "batchSize",
-               "timeout", "dataDir", "filePrefix", "encodingDb",
-               "rssiThreshold", "webPort"}
+    allowed = {"comPort", "baudRate", "readPower", "dataDir", "filePrefix",
+               "encodingDb", "rssiThreshold", "webPort"}
     for k, v in data.items():
         if k in allowed:
             _settings[k] = v
     save_settings(_settings)
-    # Reload DB if encodingDb changed
     try:
         _db = EncodingDatabase(_settings["encodingDb"])
     except Exception as e:
@@ -656,14 +626,13 @@ def on_import(data: dict):
         emit("status", {"type": "error", "error": f"File not found: {path}"})
         return
     try:
-        result = import_csv_and_analyze(
+        emit("summary", import_csv_and_analyze(
             path, _db, _settings.get("rssiThreshold", -70)
-        )
-        emit("summary", result)
+        ))
     except Exception as e:
         emit("status", {"type": "error", "error": str(e)})
 
-# ─── Entry Point ──────────────────────────────────────────────────────────────
+# ─── Entry point ──────────────────────────────────────────────────────────────
 
 def main():
     global _settings, _db
@@ -672,29 +641,25 @@ def main():
     if "--debug" in sys.argv:
         _settings["debug"] = True
 
-    debug_on = _settings.get("debug", False) or "--debug" in sys.argv
     logging.basicConfig(
-        level=logging.DEBUG if debug_on else logging.INFO,
+        level=logging.DEBUG if _settings.get("debug") else logging.INFO,
         format="%(asctime)s  %(levelname)-8s  %(message)s",
         datefmt="%H:%M:%S",
     )
 
-    db_path = _settings.get("encodingDb", "")
     try:
-        _db = EncodingDatabase(db_path)
-        logging.info("Encoding DB: %d tags loaded", len(_db))
-    except FileNotFoundError:
-        logging.error("Encoding DB not found: %s", db_path)
+        _db = EncodingDatabase(_settings["encodingDb"])
+    except FileNotFoundError as e:
+        print(f"ERROR: Encoding DB not found — {e}")
         sys.exit(1)
 
     port = _settings.get("webPort", 8765)
-    url = f"http://localhost:{port}"
-    logging.info("Starting web UI at %s", url)
+    logging.info("CAEN R1210IX  |  COM port: %s  |  Web UI: http://localhost:%d",
+                 _settings["comPort"], port)
 
-    # Open browser after a short delay so the server is ready
     def open_browser():
         time.sleep(1.2)
-        webbrowser.open(url)
+        webbrowser.open(f"http://localhost:{port}")
 
     threading.Thread(target=open_browser, daemon=True).start()
     socketio.run(app, host="0.0.0.0", port=port, debug=False)

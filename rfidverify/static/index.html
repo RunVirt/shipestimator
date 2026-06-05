@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>RFID Verifier — EliteFeats</title>
+  <title>RFID Verifier — CAEN R1210IX</title>
   <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -177,7 +177,7 @@
 
 <header>
   <h1>RFID Verifier</h1>
-  <span class="badge">EliteFeats</span>
+  <span class="badge">CAEN R1210IX</span>
   <span id="conn-dot" title="WebSocket"></span>
 </header>
 
@@ -203,22 +203,10 @@
     <div class="settings-panel">
       <h3>Settings</h3>
 
-      <div class="field"><label>Printer IP</label>
-        <input id="s-ip" type="text" /></div>
-      <div class="field"><label>Port</label>
-        <input id="s-port" type="number" /></div>
+      <div class="field"><label>COM Port</label>
+        <input id="s-com" type="text" placeholder="COM3" /></div>
       <div class="field"><label>Read Power (0–30 dBm)</label>
         <input id="s-power" type="number" min="0" max="30" /></div>
-      <div class="field"><label>Tag Position</label>
-        <select id="s-pos">
-          <option>F0</option><option>F10</option>
-          <option>B0</option><option>B10</option>
-          <option>B20</option><option>B30</option>
-        </select></div>
-      <div class="field"><label>Batch Size</label>
-        <input id="s-batch" type="number" min="1" max="200" /></div>
-      <div class="field"><label>Timeout (s)</label>
-        <input id="s-timeout" type="number" min="1" /></div>
       <div class="field"><label>RSSI Threshold (dBm)</label>
         <input id="s-rssi" type="number" /></div>
       <div class="field"><label>Encoding DB (CSV path)</label>
@@ -284,28 +272,20 @@
 
   // ── Settings ────────────────────────────────────────────────────────────────
   socket.on('settings', s => {
-    document.getElementById('s-ip').value      = s.ip      || '';
-    document.getElementById('s-port').value    = s.port    || 6101;
-    document.getElementById('s-power').value   = s.readPower !== undefined ? s.readPower : 30;
-    document.getElementById('s-pos').value     = s.tagPosition || 'F0';
-    document.getElementById('s-batch').value   = s.batchSize   || 50;
-    document.getElementById('s-timeout').value = s.timeout     || 20;
-    document.getElementById('s-rssi').value    = s.rssiThreshold !== undefined ? s.rssiThreshold : -70;
-    document.getElementById('s-db').value      = s.encodingDb   || '';
+    document.getElementById('s-com').value   = s.comPort       || 'COM3';
+    document.getElementById('s-power').value = s.readPower !== undefined ? s.readPower : 30;
+    document.getElementById('s-rssi').value  = s.rssiThreshold !== undefined ? s.rssiThreshold : -70;
+    document.getElementById('s-db').value    = s.encodingDb    || '';
     rssiThreshold = s.rssiThreshold || -70;
     if (s.dbTagCount !== undefined)
       document.getElementById('db-info').textContent =
-        `DB: ${s.dbTagCount.toLocaleString()} tags`;
+        `DB: ${s.dbTagCount.toLocaleString()} tags  |  ${s.comPort}`;
   });
 
   function saveSettings() {
     socket.emit('settings', {
-      ip:            document.getElementById('s-ip').value,
-      port:          +document.getElementById('s-port').value,
+      comPort:       document.getElementById('s-com').value,
       readPower:     +document.getElementById('s-power').value,
-      tagPosition:   document.getElementById('s-pos').value,
-      batchSize:     +document.getElementById('s-batch').value,
-      timeout:       +document.getElementById('s-timeout').value,
       rssiThreshold: +document.getElementById('s-rssi').value,
       encodingDb:    document.getElementById('s-db').value,
     });

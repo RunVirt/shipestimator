@@ -1,10 +1,7 @@
 {
-  "ip": "192.168.50.169",
-  "port": 6101,
+  "comPort": "COM3",
+  "baudRate": 115200,
   "readPower": 30,
-  "tagPosition": "F0",
-  "batchSize": 50,
-  "timeout": 20,
   "dataDir": "data",
   "filePrefix": "rfid_reads",
   "encodingDb": "EliteFeats_115000__Sheet1.csv",
