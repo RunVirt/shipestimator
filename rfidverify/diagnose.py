@@ -83,6 +83,14 @@ if not dll_path:
 
 print(f"\n{SEP}")
 print(f"Loading: {dll_path}")
+
+# Add the DLL's own directory to the search path so Windows can find
+# any sibling DLLs that CAENRFIDLib.dll depends on (Python 3.8+).
+dll_dir = str(Path(dll_path).parent)
+if hasattr(os, "add_dll_directory"):
+    os.add_dll_directory(dll_dir)
+    print(f"  Added DLL search dir: {dll_dir}")
+
 try:
     lib = ctypes.WinDLL(dll_path)
     print("  DLL loaded OK")

@@ -189,6 +189,10 @@ class CaenReader:
             return False
 
         logging.info("Loading DLL: %s", dll)
+        # Add the DLL's directory so Windows can find its sibling dependencies.
+        dll_dir = str(Path(dll).parent)
+        if hasattr(os, "add_dll_directory"):
+            os.add_dll_directory(dll_dir)
         try:
             self._lib = ctypes.WinDLL(dll)
         except OSError as e:
