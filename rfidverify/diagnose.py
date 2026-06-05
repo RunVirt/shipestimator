@@ -323,7 +323,9 @@ if not _com_ok:
 
 # ── Connection attempts ───────────────────────────────────────────────────────
 print(f"\n{SEP}")
-print(f"Attempting CAEN connection...\n")
+print("Attempting CAEN connection (USB direct, connType=3)...\n")
+print("NOTE: The RS232/COM path (connType=0) is intentionally skipped — the DLL")
+print("      crashes internally when the COM port open fails (CAEN SDK bug).\n")
 
 connected = False
 tags_found = 0
@@ -338,34 +340,45 @@ lib.CAENRFID_Init.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(ctyp
 
 handle = ctypes.c_void_p(0)
 
-# Try every (connType, portParam) combination until one works
-_attempts = [
-    (0, COM_PORT,          f"RS232  port={COM_PORT!r}"),
-    (0, rf"\\.\{COM_PORT}", f"RS232  port='\\\\.\\{COM_PORT}'"),
-    (3, None,              "USB direct (connType=3, param=NULL)"),
+# USB direct (connType=3): try NULL (auto-detect) then explicit index "0"
+_usb_attempts = [
+    (None,                "USB direct (connType=3, param=NULL — auto-detect first device)"),
+    (ctypes.c_char_p(b"0"), "USB direct (connType=3, param='0')"),
 ]
 
-for conn_type, port_param, label in _attempts:
+for param, label in _usb_attempts:
     handle = ctypes.c_void_p(0)
-    param  = ctypes.c_char_p(port_param.encode()) if port_param else None
     print(f"  Trying {label} ...")
     try:
-        ret = lib.CAENRFID_Init(conn_type, param, ctypes.byref(handle))
+        ret = lib.CAENRFID_Init(3, param, ctypes.byref(handle))
         print(f"    returned {ret},  handle={handle.value}")
         if ret == 0 and handle.value:
             connected = True
+            break
+        elif ret == -11:
+            print("    *** Error -11: CAEN reader is in use by another program.")
+            print("    Close CAEN RFID Lab (and any other CAEN software) completely,")
+            print("    then re-run this script.")
             break
         else:
             print(f"    (failed — error code {ret})")
     except OSError as e:
         print(f"    CRASHED: {e}")
-        print("    (DLL crashed internally — probably CreateFile failed despite our test above)")
-        print("    Unplug/replug the reader and try again.\n")
+        print("    DLL crashed internally — unplug/replug the reader and try again.\n")
         break
 
 if not connected:
     print(f"\n{SEP}")
     print("Could not establish a connection. Review the output above.")
+    print()
+    print("Most likely causes and fixes:")
+    print("  1. CAEN RFID Lab (or other CAEN software) is open and holds the device.")
+    print("     → Close all CAEN software, re-run this script.")
+    print()
+    print("  2. CAEN USB driver is not installed.")
+    print("     → Install CAEN RFID Lab from https://www.caen.it/products/caen-rfid-lab/")
+    print("       The installer includes the USB driver (no account needed for older versions).")
+    print("       After installation, close CAEN RFID Lab and re-run this script.")
     print(SEP)
     sys.exit(1)
 

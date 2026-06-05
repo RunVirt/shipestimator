@@ -38,9 +38,10 @@ DEFAULT_SETTINGS = {
     "rssiThreshold": -70,
     "webPort":       8765,
     "dllPath":       "",
-    # "dll"    – use CAENRFIDLib.dll (crashes on RS232 without CAEN USB driver)
-    # "serial" – pure-Python pyserial implementation (recommended)
-    "readerBackend": "serial",
+    # "dll"    – CAENRFIDLib.dll via USB direct (connType=3). Requires CAEN USB driver.
+    #            Close CAEN RFID Lab before starting this tool.
+    # "serial" – pure-Python pyserial over CDC COM port (only if reader responds on COM3)
+    "readerBackend": "dll",
     "debug":         False,
 }
 
@@ -203,9 +204,6 @@ class CaenReader:
             logging.error("Failed to load DLL: %s", e)
             return False
 
-        # CAENRFID_Init(int connType, void* pParam, int* pHandle)
-        # connType 0 = RS232 (use for USB virtual COM port like COM3)
-        # connType 3 = USB  (direct USB, no COM port)
         try:
             self._lib.CAENRFID_Init.restype  = ctypes.c_int
             self._lib.CAENRFID_Init.argtypes = [
@@ -217,16 +215,30 @@ class CaenReader:
             logging.error("CAENRFID_Init not found in DLL")
             return False
 
-        # R1210IX on USB shows as a virtual COM port → RS232 connection type
-        port_bytes = ctypes.c_char_p(self.port.encode())
-        ret = self._lib.CAENRFID_Init(0, port_bytes, ctypes.byref(self._handle))
-        if ret != 0:
-            logging.warning("CAENRFID_Init RS232(%s) returned %d, trying USB direct...", self.port, ret)
+        # Use USB direct (connType=3). The RS232 path (connType=0) crashes
+        # internally in the DLL when the COM port open fails.
+        # Try NULL param first (auto-select first device), then explicit index "0".
+        for param in (None, ctypes.c_char_p(b"0")):
             self._handle = ctypes.c_void_p(0)
-            ret = self._lib.CAENRFID_Init(3, None, ctypes.byref(self._handle))
+            try:
+                ret = self._lib.CAENRFID_Init(3, param, ctypes.byref(self._handle))
+            except OSError as e:
+                logging.error("CAENRFID_Init crashed: %s", e)
+                return False
+            if ret == 0 and self._handle.value:
+                break
+            if ret == -11:
+                logging.error(
+                    "CAENRFID_Init returned -11 (device in use). "
+                    "Close CAEN RFID Lab (or any other CAEN software) completely, "
+                    "then start this tool."
+                )
+                return False
+            logging.debug("CAENRFID_Init USB param=%s returned %d", param, ret)
 
-        if ret != 0:
-            logging.error("CAENRFID_Init failed (code %d)", ret)
+        if ret != 0 or not self._handle.value:
+            logging.error("CAENRFID_Init failed (code %d) — CAEN USB driver may not be installed. "
+                          "Install CAEN RFID Lab from caen.it to get the driver.", ret)
             return False
 
         logging.info("Connected to reader on %s (handle=%d)", self.port, self._handle.value)
@@ -452,10 +464,11 @@ class VerificationRunner:
             self._broadcast("status", {
                 "type":  "error",
                 "error": (
-                    f"Failed to connect on {self._settings['comPort']}. "
-                    "Make sure: (1) CAEN software is fully closed, "
-                    "(2) the reader is plugged in, "
-                    "(3) dllPath in settings points to the 64-bit CAENRFIDLib.dll."
+                    "Failed to connect to the CAEN reader. "
+                    "1) Close CAEN RFID Lab completely before starting this tool. "
+                    "2) Make sure the reader USB cable is plugged in. "
+                    "3) If this is the first time: install CAEN RFID Lab from caen.it "
+                    "to get the CAEN USB driver, then close it before using this app."
                 ),
             })
             self._running = False
